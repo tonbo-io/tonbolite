@@ -1,0 +1,16 @@
+[package]
+name = "sqlite-tonbo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+flume = "0.11"
+fusio = { git = "https://github.com/tonbo-io/fusio.git", rev = "8038993675591f87dd65b88ffdade31dc0a254b7", package = "fusio", features = [
+    "dyn",
+    "fs",
+] }
+futures-util = "0.3"
+tokio = "1.41"
+tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "4844cb8409a48b680467705bb05cbcac2edcb8c6", package = "tonbo" }
+tonbo_macros = { git = "https://github.com/tonbo-io/tonbo", rev = "4844cb8409a48b680467705bb05cbcac2edcb8c6", package = "tonbo_macros" }
+rusqlite = { version = "0.32" , features = ["vtab", "bundled"]}
