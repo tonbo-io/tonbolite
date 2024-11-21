@@ -32,7 +32,13 @@ macro_rules! value_trans {
 macro_rules! set_result {
     ($context:expr, $column:expr, $ty:ty) => {
         if $column.is_nullable {
-            $context.set_result($column.value.as_ref().downcast_ref::<Option<$ty>>().unwrap())?;
+            $context.set_result(
+                $column
+                    .value
+                    .as_ref()
+                    .downcast_ref::<Option<$ty>>()
+                    .unwrap(),
+            )?;
         } else {
             $context.set_result($column.value.as_ref().downcast_ref::<$ty>().unwrap())?;
         }
@@ -150,7 +156,7 @@ impl TonboTable {
             .await
             .map_err(|err| Error::ModuleError(err.to_string()))
         })?;
-        
+
         Ok((
             format!("CREATE TABLE tonbo({})", fields.join(", ")),
             Self {
@@ -341,7 +347,7 @@ unsafe impl VTabCursor for RecordCursor<'_> {
     }
 }
 
-fn value_trans(value: ValueRef<'_>, ty: &Datatype, is_nullable: bool) -> Arc<dyn Any> {
+fn value_trans(value: ValueRef<'_>, _ty: &Datatype, is_nullable: bool) -> Arc<dyn Any> {
     match value {
         ValueRef::Null => {
             todo!()
@@ -361,8 +367,8 @@ fn value_trans(value: ValueRef<'_>, ty: &Datatype, is_nullable: bool) -> Arc<dyn
         }
         ValueRef::Integer(v) => value_trans!(is_nullable, v),
         ValueRef::Real(v) => value_trans!(is_nullable, v),
-        ValueRef::Text(v) => value_trans!(is_nullable, v),
-        ValueRef::Blob(v) => value_trans!(is_nullable, v),
+        ValueRef::Text(v) => value_trans!(is_nullable, String::from_utf8(v.to_vec())),
+        ValueRef::Blob(v) => value_trans!(is_nullable, v.to_vec()),
     }
 }
 
