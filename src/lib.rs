@@ -19,37 +19,6 @@ use tonbo::record::runtime::Datatype;
 use tonbo::record::{Column, ColumnDesc, DynRecord, Record};
 use tonbo::{DbOption, DB};
 
-macro_rules! value_trans {
-    ($is_nullable:expr, $value:expr) => {
-        if $is_nullable {
-            Arc::new(Some($value))
-        } else {
-            Arc::new($value)
-        }
-    };
-}
-
-macro_rules! set_result {
-    ($context:expr, $column:expr, $ty:ty) => {
-        if $column.is_nullable {
-            $context.set_result(
-                $column
-                    .value
-                    .as_ref()
-                    .downcast_ref::<Option<$ty>>()
-                    .unwrap(),
-            )?;
-        } else {
-            $context.set_result($column.value.as_ref().downcast_ref::<$ty>().unwrap())?;
-        }
-    };
-}
-
-struct Tuple {
-    pk_i: usize,
-    values: Vec<Column>,
-}
-
 pub fn load_module(conn: &Connection) -> rusqlite::Result<()> {
     let _ = fs::create_dir_all("./db_path/tonbo");
     let runtime = Builder::new_multi_thread()
@@ -196,7 +165,7 @@ unsafe impl<'vtab> VTab<'vtab> for TonboTable {
             )>,
             _,
         ) = flume::bounded(1);
-        let (tuple_tx, tuple_rx): (Sender<Option<Tuple>>, _) = flume::bounded(10);
+        let (tuple_tx, tuple_rx): (Sender<Option<(Vec<Column>, usize)>>, _) = flume::bounded(10);
         let database = self.database.clone();
 
         self.state.runtime.spawn(async move {
@@ -213,10 +182,7 @@ unsafe impl<'vtab> VTab<'vtab> for TonboTable {
                     let entry = result.unwrap();
                     let value = entry.value().unwrap();
 
-                    let _ = tuple_tx.send(Some(Tuple {
-                        pk_i: value.primary_index,
-                        values: value.columns,
-                    }));
+                    let _ = tuple_tx.send(Some((value.columns, value.primary_index)));
                 }
                 let _ = tuple_tx.send(None);
             }
@@ -256,8 +222,8 @@ pub struct RecordCursor<'vtab> {
         Bound<<DynRecord as Record>::Key>,
         Bound<<DynRecord as Record>::Key>,
     )>,
-    tuple_rx: Receiver<Option<Tuple>>,
-    buf: Option<Tuple>,
+    tuple_rx: Receiver<Option<(Vec<Column>, usize)>>,
+    buf: Option<(Vec<Column>, usize)>,
     _p: PhantomData<&'vtab TonboTable>,
 }
 
@@ -334,16 +300,16 @@ unsafe impl VTabCursor for RecordCursor<'_> {
     }
 
     fn column(&self, ctx: &mut Context, i: c_int) -> rusqlite::Result<()> {
-        if let Some(tuple) = &self.buf {
-            set_result(ctx, &tuple.values[i as usize])?;
+        if let Some((columns, _)) = &self.buf {
+            set_result(ctx, &columns[i as usize])?;
         }
         Ok(())
     }
 
     fn rowid(&self) -> rusqlite::Result<i64> {
-        let Tuple { values, pk_i } = self.buf.as_ref().unwrap();
+        let (columns, pk_i) = self.buf.as_ref().unwrap();
 
-        Ok(*values[*pk_i].value.downcast_ref().unwrap())
+        Ok(*columns[*pk_i].value.downcast_ref().unwrap())
     }
 }
 
@@ -365,26 +331,121 @@ fn value_trans(value: ValueRef<'_>, _ty: &Datatype, is_nullable: bool) -> Arc<dy
             //     Datatype::Bytes => Arc::new(Option::<Vec<u8>>::None),
             // }
         }
-        ValueRef::Integer(v) => value_trans!(is_nullable, v),
-        ValueRef::Real(v) => value_trans!(is_nullable, v),
-        ValueRef::Text(v) => value_trans!(is_nullable, String::from_utf8(v.to_vec())),
-        ValueRef::Blob(v) => value_trans!(is_nullable, v.to_vec()),
+        ValueRef::Integer(v) => {
+            if is_nullable {
+                Arc::new(Some(v))
+            } else {
+                Arc::new(v)
+            }
+        }
+        ValueRef::Real(v) => {
+            if is_nullable {
+                Arc::new(Some(v))
+            } else {
+                Arc::new(v)
+            }
+        }
+        ValueRef::Text(v) => {
+            if is_nullable {
+                Arc::new(Some(String::from_utf8(v.to_vec()).unwrap()))
+            } else {
+                Arc::new(String::from_utf8(v.to_vec()).unwrap())
+            }
+        }
+        ValueRef::Blob(v) => {
+            if is_nullable {
+                Arc::new(Some(v.to_vec()))
+            } else {
+                Arc::new(v.to_vec())
+            }
+        }
     }
 }
 
 fn set_result(ctx: &mut Context, col: &Column) -> rusqlite::Result<()> {
     match &col.datatype {
-        Datatype::UInt8 => set_result!(ctx, col, u8),
-        Datatype::UInt16 => set_result!(ctx, col, u16),
-        Datatype::UInt32 => set_result!(ctx, col, u32),
-        Datatype::UInt64 => set_result!(ctx, col, u64),
-        Datatype::Int8 => set_result!(ctx, col, i8),
-        Datatype::Int16 => set_result!(ctx, col, i16),
-        Datatype::Int32 => set_result!(ctx, col, i32),
-        Datatype::Int64 => set_result!(ctx, col, i64),
-        Datatype::String => set_result!(ctx, col, String),
-        Datatype::Boolean => set_result!(ctx, col, bool),
-        Datatype::Bytes => set_result!(ctx, col, Vec<u8>),
+        Datatype::UInt8 => {
+            if col.is_nullable {
+                ctx.set_result(col.value.as_ref().downcast_ref::<Option<u8>>().unwrap())?;
+            } else {
+                ctx.set_result(col.value.as_ref().downcast_ref::<u8>().unwrap())?;
+            }
+        }
+        Datatype::UInt16 => {
+            if col.is_nullable {
+                ctx.set_result(col.value.as_ref().downcast_ref::<Option<u16>>().unwrap())?;
+            } else {
+                ctx.set_result(col.value.as_ref().downcast_ref::<u16>().unwrap())?;
+            }
+        }
+        Datatype::UInt32 => {
+            if col.is_nullable {
+                ctx.set_result(col.value.as_ref().downcast_ref::<Option<u32>>().unwrap())?;
+            } else {
+                ctx.set_result(col.value.as_ref().downcast_ref::<u32>().unwrap())?;
+            }
+        }
+        Datatype::UInt64 => {
+            if col.is_nullable {
+                ctx.set_result(col.value.as_ref().downcast_ref::<Option<u64>>().unwrap())?;
+            } else {
+                ctx.set_result(col.value.as_ref().downcast_ref::<u64>().unwrap())?;
+            }
+        }
+        Datatype::Int8 => {
+            if col.is_nullable {
+                ctx.set_result(col.value.as_ref().downcast_ref::<Option<i8>>().unwrap())?;
+            } else {
+                ctx.set_result(col.value.as_ref().downcast_ref::<i8>().unwrap())?;
+            }
+        }
+        Datatype::Int16 => {
+            if col.is_nullable {
+                ctx.set_result(col.value.as_ref().downcast_ref::<Option<i16>>().unwrap())?;
+            } else {
+                ctx.set_result(col.value.as_ref().downcast_ref::<i16>().unwrap())?;
+            }
+        }
+        Datatype::Int32 => {
+            if col.is_nullable {
+                ctx.set_result(col.value.as_ref().downcast_ref::<Option<i32>>().unwrap())?;
+            } else {
+                ctx.set_result(col.value.as_ref().downcast_ref::<i32>().unwrap())?;
+            }
+        }
+        Datatype::Int64 => {
+            if col.is_nullable {
+                ctx.set_result(col.value.as_ref().downcast_ref::<Option<i64>>().unwrap())?;
+            } else {
+                ctx.set_result(col.value.as_ref().downcast_ref::<i64>().unwrap())?;
+            }
+        }
+        Datatype::String => {
+            if col.is_nullable {
+                ctx.set_result(col.value.as_ref().downcast_ref::<Option<String>>().unwrap())?;
+            } else {
+                ctx.set_result(col.value.as_ref().downcast_ref::<String>().unwrap())?;
+            }
+        }
+        Datatype::Boolean => {
+            if col.is_nullable {
+                ctx.set_result(col.value.as_ref().downcast_ref::<Option<bool>>().unwrap())?;
+            } else {
+                ctx.set_result(col.value.as_ref().downcast_ref::<bool>().unwrap())?;
+            }
+        }
+        Datatype::Bytes => {
+            if col.is_nullable {
+                ctx.set_result(
+                    col.value
+                        .as_ref()
+                        .downcast_ref::<Option<Vec<u8>>>()
+                        .unwrap(),
+                )?;
+            } else {
+                ctx.set_result(col.value.as_ref().downcast_ref::<Vec<u8>>().unwrap())?;
+            }
+        }
     }
     Ok(())
 }
