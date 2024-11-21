@@ -1,3 +1,4 @@
+use std::any::Any;
 use flume::{Receiver, Sender};
 use fusio::path::Path;
 use futures_util::StreamExt;
@@ -6,78 +7,136 @@ use rusqlite::vtab::{
     update_module, Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor,
     VTabKind, Values,
 };
-use rusqlite::{ffi, Connection, Error};
+use rusqlite::{ffi, vtab, Connection, Error, ToSql};
 use std::collections::Bound;
 use std::ffi::c_int;
 use std::fs;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::runtime::{Builder, Runtime};
 use tonbo::executor::tokio::TokioExecutor;
-use tonbo::record::Record;
+use tonbo::record::{Column, ColumnDesc, DynRecord, Record};
+use tonbo::record::runtime::Datatype;
 use tonbo::{DbOption, DB};
 use tonbo_macros::Record;
+use bytes::Bytes;
 
 pub fn load_module(conn: &Connection) -> rusqlite::Result<()> {
-    let _ = fs::create_dir_all("./db_path/music");
+    let _ = fs::create_dir_all("./db_path/tonbo");
     let runtime = Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
         .build()
         .unwrap();
-    let database = runtime.block_on(async {
-        let options = DbOption::from(Path::from_filesystem_path("./db_path/music").unwrap());
-        DB::new(options, TokioExecutor::default())
-            .await
-            .map_err(|err| Error::ModuleError(err.to_string()))
-    })?;
+
 
     let aux = Some(Arc::new(DbState {
         runtime,
-        database: Arc::new(database),
     }));
-    conn.create_module("tonbo", update_module::<MusicTable>(), aux)
-}
-
-#[derive(Record, Debug)]
-pub struct Music {
-    #[record(primary_key)]
-    id: i64,
-    name: Option<String>,
-    like: i64,
+    conn.create_module("tonbo", update_module::<TonboTable>(), aux)
 }
 
 pub struct DbState {
     runtime: Runtime,
-    database: Arc<DB<Music, TokioExecutor>>,
 }
 
 #[repr(C)]
-pub struct MusicTable {
+pub struct TonboTable {
     base: ffi::sqlite3_vtab,
     state: Arc<DbState>,
+    database: Arc<DB<DynRecord, TokioExecutor>>,
+    primary_key_index: usize,
+    column_desc: Vec<ColumnDesc>,
 }
 
-impl MusicTable {
+impl TonboTable {
+    fn parse_type(input: &str) -> rusqlite::Result<(Datatype, bool, bool)> {
+        let input = input.trim();
+
+        let is_nullable = input.contains("nullable");
+        let is_primary_key = input.contains("primary key");
+
+        let mut type_str = input.to_string();
+        if is_nullable {
+            type_str = type_str.replace("nullable", "");
+        }
+        if is_primary_key {
+            type_str = type_str.replace("primary key", "");
+        }
+        let ty = match type_str.trim() {
+            "int" => Datatype::Int64,
+            "varchar" => Datatype::String,
+            _ => {
+                return Err(Error::ModuleError(format!(
+                    "unrecognized parameter '{input}'"
+                )));
+            }
+        };
+
+        Ok((ty, is_nullable, is_primary_key))
+    }
+
     fn connect_create(
         _: &mut VTabConnection,
         aux: Option<&Arc<DbState>>,
-        _: &[&[u8]],
+        args: &[&[u8]],
         _: bool,
     ) -> rusqlite::Result<(String, Self)> {
+        let mut primary_key_index = None;
+        let mut descs = Vec::new();
+        let mut fields = Vec::with_capacity(args.len());
+
+        let mut i = 0;
+        for c_slice in args.iter() {
+            let Ok((param, value)) = vtab::parameter(c_slice) else {
+                continue
+            };
+            let (ty, is_nullable, is_primary_key) = Self::parse_type(value)?;
+
+            if is_primary_key {
+                if primary_key_index.is_some() {
+                    return Err(Error::ModuleError("the primary key must exist and only one is allowed".to_string()))
+                }
+                primary_key_index = Some(i)
+            }
+
+            fields.push(format!("{} {}", param, value));
+            descs.push(ColumnDesc::new(param.to_string(), ty, is_nullable));
+            i += 1;
+        }
+        let primary_key_index = primary_key_index.ok_or_else(|| Error::ModuleError("the primary key must exist and only one is allowed".to_string()))?;
+        if descs[primary_key_index].datatype != Datatype::Int64 {
+            return Err(Error::ModuleError("the primary key must be of int type".to_string()));
+        }
+        let database = aux.unwrap().runtime.block_on(async {
+            let options = DbOption::with_path(
+                Path::from_filesystem_path("./db_path/tonbo").unwrap(),
+                descs[primary_key_index].name.clone(),
+                primary_key_index
+            );
+
+            DB::with_schema(options, TokioExecutor::default(), descs.clone(), primary_key_index)
+                .await
+                .map_err(|err| Error::ModuleError(err.to_string()))
+        })?;
+
+        println!("{}", format!("CREATE TABLE tonbo({})", fields.join(", ")));
         Ok((
-            "CREATE TABLE music(id int, name varchar, like int)".to_string(),
+            format!("CREATE TABLE tonbo({})", fields.join(", ")),
             Self {
                 base: ffi::sqlite3_vtab::default(),
                 state: aux.unwrap().clone(),
+                database: Arc::new(database),
+                primary_key_index,
+                column_desc: descs,
             },
         ))
     }
 }
 
-unsafe impl<'vtab> VTab<'vtab> for MusicTable {
+unsafe impl<'vtab> VTab<'vtab> for TonboTable {
     type Aux = Arc<DbState>;
-    type Cursor = MusicCursor<'vtab>;
+    type Cursor = RecordCursor<'vtab>;
 
     fn connect(
         db: &mut VTabConnection,
@@ -94,40 +153,31 @@ unsafe impl<'vtab> VTab<'vtab> for MusicTable {
     }
 
     fn open(&'vtab mut self) -> rusqlite::Result<Self::Cursor> {
-        let (req_tx, req_rx): (Sender<MusicRequest>, _) = flume::bounded(1);
-        let (tuple_tx, tuple_rx): (Sender<Option<Music>>, _) = flume::bounded(10);
-        let database = self.state.database.clone();
+        let (req_tx, req_rx): (Sender<(Bound<<DynRecord as Record>::Key>, Bound<<DynRecord as Record>::Key>)>, _) = flume::bounded(1);
+        let (tuple_tx, tuple_rx): (Sender<Option<DynRecord>>, _) = flume::bounded(10);
+        let database = self.database.clone();
 
         self.state.runtime.spawn(async move {
-            while let Ok(req) = req_rx.recv() {
+            while let Ok((lower, upper)) = req_rx.recv() {
                 let transaction = database.transaction().await;
 
-                match req {
-                    MusicRequest::Query((lower, upper)) => {
-                        let mut stream = transaction
-                            .scan((lower.as_ref(), upper.as_ref()))
-                            .take()
-                            .await
-                            .unwrap();
+                let mut stream = transaction
+                    .scan((lower.as_ref(), upper.as_ref()))
+                    .take()
+                    .await
+                    .unwrap();
 
-                        while let Some(result) = stream.next().await {
-                            let entry = result.unwrap();
+                while let Some(result) = stream.next().await {
+                    let entry = result.unwrap();
+                    let value = entry.value().unwrap();
 
-                            let item = Music {
-                                id: entry.value().unwrap().id,
-                                name: Some(entry.value().unwrap().name.unwrap().to_string()),
-                                like: entry.value().unwrap().like.unwrap(),
-                            };
-
-                            let _ = tuple_tx.send(Some(item));
-                        }
-                        let _ = tuple_tx.send(None);
-                    }
+                    let _ = tuple_tx.send(Some(DynRecord::new(value.columns, value.primary_index)));
                 }
+                let _ = tuple_tx.send(None);
             }
         });
 
-        Ok(MusicCursor {
+        Ok(RecordCursor {
             base: ffi::sqlite3_vtab_cursor::default(),
             req_tx,
             tuple_rx,
@@ -137,7 +187,7 @@ unsafe impl<'vtab> VTab<'vtab> for MusicTable {
     }
 }
 
-impl CreateVTab<'_> for MusicTable {
+impl CreateVTab<'_> for TonboTable {
     const KIND: VTabKind = VTabKind::Default;
 
     fn create(
@@ -153,27 +203,23 @@ impl CreateVTab<'_> for MusicTable {
     }
 }
 
-pub(crate) enum MusicRequest {
-    Query((Bound<<Music as Record>::Key>, Bound<<Music as Record>::Key>)),
-}
-
 #[repr(C)]
-pub struct MusicCursor<'vtab> {
+pub struct RecordCursor<'vtab> {
     /// Base class. Must be first
     base: ffi::sqlite3_vtab_cursor,
-    req_tx: Sender<MusicRequest>,
-    tuple_rx: Receiver<Option<Music>>,
-    buf: Option<Music>,
-    _p: PhantomData<&'vtab MusicTable>,
+    req_tx: Sender<(Bound<<DynRecord as Record>::Key>, Bound<<DynRecord as Record>::Key>)>,
+    tuple_rx: Receiver<Option<DynRecord>>,
+    buf: Option<DynRecord>,
+    _p: PhantomData<&'vtab TonboTable>,
 }
 
-impl MusicCursor<'_> {
-    fn vtab(&self) -> &MusicTable {
-        unsafe { &*(self.base.pVtab as *const MusicTable) }
+impl RecordCursor<'_> {
+    fn vtab(&self) -> &TonboTable {
+        unsafe { &*(self.base.pVtab as *const TonboTable) }
     }
 }
 
-impl UpdateVTab<'_> for MusicTable {
+impl UpdateVTab<'_> for TonboTable {
     fn delete(&mut self, _: ValueRef<'_>) -> rusqlite::Result<()> {
         todo!()
     }
@@ -184,25 +230,27 @@ impl UpdateVTab<'_> for MusicTable {
         let _ = args.next();
         let _ = args.next();
 
-        let id = args.next().unwrap().as_i64().unwrap();
-        let name = args
-            .next()
-            .unwrap()
-            .as_str_or_null()
-            .unwrap()
-            .map(str::to_string);
-        let like = args.next().unwrap().as_i64().unwrap();
+        let mut id = None;
+        let values = self.column_desc.iter()
+            .zip(args)
+            .enumerate()
+            .map(|(i, (desc, value))| {
+                if i == self.primary_key_index {
+                    id = Some(value);
+                }
+                Column::new(desc.datatype, desc.name.clone(), value_trans(value, &desc.datatype), desc.is_nullable)
+            })
+            .collect();
 
         self.state
             .runtime
             .block_on(async {
-                self.state
-                    .database
-                    .insert(Music { id, name, like })
+                self.database
+                    .insert(DynRecord::new(values, self.primary_key_index))
                     .await
-                    .map(|_| id)
             })
-            .map_err(|err| Error::ModuleError(err.to_string()))
+            .map_err(|err| Error::ModuleError(err.to_string()))?;
+        Ok(id.unwrap().as_i64()?)
     }
 
     fn update(&mut self, _: &Values<'_>) -> rusqlite::Result<()> {
@@ -210,10 +258,10 @@ impl UpdateVTab<'_> for MusicTable {
     }
 }
 
-unsafe impl VTabCursor for MusicCursor<'_> {
+unsafe impl VTabCursor for RecordCursor<'_> {
     fn filter(&mut self, _: c_int, _: Option<&str>, _: &Values<'_>) -> rusqlite::Result<()> {
         self.req_tx
-            .send(MusicRequest::Query((Bound::Unbounded, Bound::Unbounded)))
+            .send((Bound::Unbounded, Bound::Unbounded))
             .unwrap();
         self.next()?;
 
@@ -231,35 +279,83 @@ unsafe impl VTabCursor for MusicCursor<'_> {
     }
 
     fn column(&self, ctx: &mut Context, i: c_int) -> rusqlite::Result<()> {
-        if i > 2 {
-            return Err(Error::ModuleError(format!(
-                "column index out of bounds: {i}"
-            )));
-        }
         if let Some(item) = &self.buf {
-            match i {
-                0 => ctx.set_result(&item.id)?,
-                1 => {
-                    if let Some(like) = &item.name {
-                        ctx.set_result(like)?;
-                    } else {
-                        ctx.set_result(&Null)?;
-                    }
-                }
-                2 => ctx.set_result(&item.name)?,
-                _ => {
-                    return Err(Error::ModuleError(format!(
-                        "column index out of bounds: {i}"
-                    )))
-                }
-            }
+            println!("{:#?}", item);
+            set_result(ctx, &item.as_record_ref().columns[i as usize])?;
         }
         Ok(())
     }
 
     fn rowid(&self) -> rusqlite::Result<i64> {
-        Ok(self.buf.as_ref().unwrap().id)
+        let record_ref = self.buf.as_ref().unwrap().as_record_ref();
+
+        Ok(*record_ref.columns[record_ref.primary_index].value.downcast_ref().unwrap())
     }
+}
+
+fn value_trans(value: ValueRef<'_>, ty: &Datatype) -> Arc<dyn Any> {
+    println!("{:#?} {:#?}", value, ty);
+    match value {
+        ValueRef::Null => {
+            todo!()
+            // match ty {
+            //     Datatype::UInt8 => Arc::new(Option::<u8>::None),
+            //     Datatype::UInt16 => Arc::new(Option::<u16>::None),
+            //     Datatype::UInt32 => Arc::new(Option::<u32>::None),
+            //     Datatype::UInt64 => Arc::new(Option::<u64>::None),
+            //     Datatype::Int8 => Arc::new(Option::<i8>::None),
+            //     Datatype::Int16 => Arc::new(Option::<i16>::None),
+            //     Datatype::Int32 => Arc::new(Option::<i32>::None),
+            //     Datatype::Int64 => Arc::new(Option::<i64>::None),
+            //     Datatype::String => Arc::new(Option::<String>::None),
+            //     Datatype::Boolean => Arc::new(Option::<bool>::None),
+            //     Datatype::Bytes => Arc::new(Option::<Vec<u8>>::None),
+            // }
+        },
+        ValueRef::Integer(v) => Arc::new(v),
+        ValueRef::Real(v) => Arc::new(v),
+        ValueRef::Text(v) => Arc::new(String::from_utf8(v.to_vec()).unwrap()),
+        ValueRef::Blob(v) => Arc::new(v.to_vec()),
+    }
+}
+
+fn set_result(ctx: &mut Context, col: &Column) -> rusqlite::Result<()> {
+    match &col.datatype {
+        Datatype::UInt8 => {
+            ctx.set_result(col.value.as_ref().downcast_ref::<u8>().unwrap())?;
+        }
+        Datatype::UInt16 => {
+            ctx.set_result(col.value.as_ref().downcast_ref::<u16>().unwrap())?;
+        }
+        Datatype::UInt32 => {
+            ctx.set_result(col.value.as_ref().downcast_ref::<u32>().unwrap())?;
+        }
+        Datatype::UInt64 => {
+            ctx.set_result(col.value.as_ref().downcast_ref::<u64>().unwrap())?;
+        }
+        Datatype::Int8 => {
+            ctx.set_result(col.value.as_ref().downcast_ref::<i8>().unwrap())?;
+        }
+        Datatype::Int16 => {
+            ctx.set_result(col.value.as_ref().downcast_ref::<i16>().unwrap())?;
+        }
+        Datatype::Int32 => {
+            ctx.set_result(col.value.as_ref().downcast_ref::<i32>().unwrap())?;
+        }
+        Datatype::Int64 => {
+            ctx.set_result(col.value.as_ref().downcast_ref::<i64>().unwrap())?;
+        }
+        Datatype::String => {
+            ctx.set_result(col.value.as_ref().downcast_ref::<String>().unwrap())?;
+        },
+        Datatype::Boolean => {
+            ctx.set_result(col.value.as_ref().downcast_ref::<bool>().unwrap())?;
+        }
+        Datatype::Bytes => {
+            ctx.set_result(col.value.as_ref().downcast_ref::<Vec<u8>>().unwrap())?;
+        },
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -271,7 +367,11 @@ pub(crate) mod tests {
         let db = Connection::open_in_memory()?;
         super::load_module(&db)?;
 
-        db.execute_batch("CREATE VIRTUAL TABLE temp.music USING tonbo();")?;
+        db.execute_batch("CREATE VIRTUAL TABLE temp.music USING tonbo(
+                    id='int primary key',
+                    name='varchar nullable',
+                    like='int'
+                    );")?;
         db.execute(
             "INSERT INTO music (id, name, like) VALUES (0, 'lol', 0)",
             [],
