@@ -1,3 +1,7 @@
+mod executor;
+
+use crate::executor::tokio::TokioExecutor;
+use crate::executor::BlockOnExecutor;
 use flume::{Receiver, Sender};
 use fusio::path::Path;
 use futures_util::StreamExt;
@@ -13,26 +17,30 @@ use std::ffi::c_int;
 use std::fs;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use tokio::runtime::{Builder, Runtime};
-use tonbo::executor::tokio::TokioExecutor;
+use tokio::runtime::Builder;
+use tonbo::executor::Executor;
 use tonbo::record::runtime::Datatype;
 use tonbo::record::{Column, ColumnDesc, DynRecord, Record};
 use tonbo::{DbOption, DB};
 
 pub fn load_module(conn: &Connection) -> rusqlite::Result<()> {
     let _ = fs::create_dir_all("./db_path/tonbo");
-    let runtime = Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .unwrap();
+    let runtime = Arc::new(
+        Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
 
-    let aux = Some(Arc::new(DbState { runtime }));
+    let aux = Some(Arc::new(DbState {
+        executor: TokioExecutor { runtime },
+    }));
     conn.create_module("tonbo", update_module::<TonboTable>(), aux)
 }
 
 pub struct DbState {
-    runtime: Runtime,
+    executor: TokioExecutor,
 }
 
 #[repr(C)]
@@ -109,21 +117,17 @@ impl TonboTable {
                 "the primary key must be of int type".to_string(),
             ));
         }
-        let database = aux.unwrap().runtime.block_on(async {
+        let executor = aux.unwrap().executor.clone();
+        let database = aux.unwrap().executor.block_on(async {
             let options = DbOption::with_path(
                 Path::from_filesystem_path("./db_path/tonbo").unwrap(),
                 descs[primary_key_index].name.clone(),
                 primary_key_index,
             );
 
-            DB::with_schema(
-                options,
-                TokioExecutor::default(),
-                descs.clone(),
-                primary_key_index,
-            )
-            .await
-            .map_err(|err| Error::ModuleError(err.to_string()))
+            DB::with_schema(options, executor, descs.clone(), primary_key_index)
+                .await
+                .map_err(|err| Error::ModuleError(err.to_string()))
         })?;
 
         Ok((
@@ -168,7 +172,7 @@ unsafe impl<'vtab> VTab<'vtab> for TonboTable {
         let (tuple_tx, tuple_rx): (Sender<Option<(Vec<Column>, usize)>>, _) = flume::bounded(10);
         let database = self.database.clone();
 
-        self.state.runtime.spawn(async move {
+        self.state.executor.spawn(async move {
             while let Ok((lower, upper)) = req_rx.recv() {
                 let transaction = database.transaction().await;
 
@@ -264,7 +268,7 @@ impl UpdateVTab<'_> for TonboTable {
             .collect();
 
         self.state
-            .runtime
+            .executor
             .block_on(async {
                 self.database
                     .insert(DynRecord::new(values, self.primary_key_index))
