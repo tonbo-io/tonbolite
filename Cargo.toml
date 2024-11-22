@@ -17,3 +17,4 @@ tokio = { version = "1.41", features = ["rt-multi-thread"] }
 tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "4844cb8409a48b680467705bb05cbcac2edcb8c6", package = "tonbo" }
 tonbo_macros = { git = "https://github.com/tonbo-io/tonbo", rev = "4844cb8409a48b680467705bb05cbcac2edcb8c6", package = "tonbo_macros" }
 rusqlite = { version = "0.32" , features = ["vtab", "bundled"]}
+sqlparser = "0.52"
