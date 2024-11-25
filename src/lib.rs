@@ -353,23 +353,19 @@ impl UpdateVTab<'_> for TonboTable {
         let _ = args.next();
 
         let mut id = None;
-        let values = self
-            .column_desc
-            .iter()
-            .zip(args)
-            .enumerate()
-            .map(|(i, (desc, value))| {
-                if i == self.primary_key_index {
-                    id = Some(value);
-                }
-                Column::new(
-                    desc.datatype,
-                    desc.name.clone(),
-                    value_trans(value, &desc.datatype, desc.is_nullable),
-                    desc.is_nullable,
-                )
-            })
-            .collect();
+        let mut values = Vec::with_capacity(self.column_desc.len());
+
+        for (i, (desc, value)) in self.column_desc.iter().zip(args).enumerate() {
+            if i == self.primary_key_index {
+                id = Some(value);
+            }
+            values.push(Column::new(
+                desc.datatype,
+                desc.name.clone(),
+                value_trans(value, &desc.datatype, desc.is_nullable)?,
+                desc.is_nullable,
+            ));
+        }
 
         self.state
             .executor
@@ -421,52 +417,96 @@ unsafe impl VTabCursor for RecordCursor<'_> {
     }
 }
 
+macro_rules! nullable_value {
+    ($value:expr, $is_nullable:expr) => {
+        if $is_nullable {
+            Arc::new(Some($value)) as Arc<dyn Any>
+        } else {
+            Arc::new($value) as Arc<dyn Any>
+        }
+    };
+}
+
 // TODO: Value Cast
-fn value_trans(value: ValueRef<'_>, _ty: &Datatype, is_nullable: bool) -> Arc<dyn Any> {
+fn value_trans(
+    value: ValueRef<'_>,
+    ty: &Datatype,
+    is_nullable: bool,
+) -> rusqlite::Result<Arc<dyn Any>> {
     match value {
         ValueRef::Null => {
-            todo!()
-            // match ty {
-            //     Datatype::UInt8 => Arc::new(Option::<u8>::None),
-            //     Datatype::UInt16 => Arc::new(Option::<u16>::None),
-            //     Datatype::UInt32 => Arc::new(Option::<u32>::None),
-            //     Datatype::UInt64 => Arc::new(Option::<u64>::None),
-            //     Datatype::Int8 => Arc::new(Option::<i8>::None),
-            //     Datatype::Int16 => Arc::new(Option::<i16>::None),
-            //     Datatype::Int32 => Arc::new(Option::<i32>::None),
-            //     Datatype::Int64 => Arc::new(Option::<i64>::None),
-            //     Datatype::String => Arc::new(Option::<String>::None),
-            //     Datatype::Boolean => Arc::new(Option::<bool>::None),
-            //     Datatype::Bytes => Arc::new(Option::<Vec<u8>>::None),
-            // }
+            if !is_nullable {
+                return Err(Error::ModuleError("value is not nullable".to_string()));
+            }
+            Ok(match ty {
+                Datatype::UInt8 => Arc::new(Option::<u8>::None),
+                Datatype::UInt16 => Arc::new(Option::<u16>::None),
+                Datatype::UInt32 => Arc::new(Option::<u32>::None),
+                Datatype::UInt64 => Arc::new(Option::<u64>::None),
+                Datatype::Int8 => Arc::new(Option::<i8>::None),
+                Datatype::Int16 => Arc::new(Option::<i16>::None),
+                Datatype::Int32 => Arc::new(Option::<i32>::None),
+                Datatype::Int64 => Arc::new(Option::<i64>::None),
+                Datatype::String => Arc::new(Option::<String>::None),
+                Datatype::Boolean => Arc::new(Option::<bool>::None),
+                Datatype::Bytes => Arc::new(Option::<Vec<u8>>::None),
+            })
         }
         ValueRef::Integer(v) => {
-            if is_nullable {
-                Arc::new(Some(v))
-            } else {
-                Arc::new(v)
-            }
+            let value = match ty {
+                Datatype::UInt8 => nullable_value!(v as u8, is_nullable),
+                Datatype::UInt16 => nullable_value!(v as u16, is_nullable),
+                Datatype::UInt32 => nullable_value!(v as u32, is_nullable),
+                Datatype::UInt64 => nullable_value!(v as u64, is_nullable),
+                Datatype::Int8 => nullable_value!(v as i8, is_nullable),
+                Datatype::Int16 => nullable_value!(v as i16, is_nullable),
+                Datatype::Int32 => nullable_value!(v as i32, is_nullable),
+                Datatype::Int64 => nullable_value!(v, is_nullable),
+                _ => {
+                    return Err(Error::ModuleError(format!(
+                        "unsupported value: {:#?} cast to: {:#?}",
+                        v, ty
+                    )))
+                }
+            };
+
+            Ok(value)
         }
-        ValueRef::Real(v) => {
-            if is_nullable {
-                Arc::new(Some(v))
-            } else {
-                Arc::new(v)
-            }
+        ValueRef::Real(_) => {
+            todo!("tonbo f32/f64 unsupported yet")
         }
         ValueRef::Text(v) => {
-            if is_nullable {
-                Arc::new(Some(String::from_utf8(v.to_vec()).unwrap()))
-            } else {
-                Arc::new(String::from_utf8(v.to_vec()).unwrap())
+            if let Datatype::Bytes = ty {
+                return Ok(nullable_value!(v.to_vec(), is_nullable));
             }
+            let v = String::from_utf8(v.to_vec()).unwrap();
+            let value = match ty {
+                Datatype::UInt8 => nullable_value!(v.parse::<u8>().unwrap(), is_nullable),
+                Datatype::UInt16 => nullable_value!(v.parse::<u16>().unwrap(), is_nullable),
+                Datatype::UInt32 => nullable_value!(v.parse::<u32>().unwrap(), is_nullable),
+                Datatype::UInt64 => nullable_value!(v.parse::<u64>().unwrap(), is_nullable),
+                Datatype::Int8 => nullable_value!(v.parse::<i8>().unwrap(), is_nullable),
+                Datatype::Int16 => nullable_value!(v.parse::<i16>().unwrap(), is_nullable),
+                Datatype::Int32 => nullable_value!(v.parse::<i32>().unwrap(), is_nullable),
+                Datatype::Int64 => nullable_value!(v.parse::<i64>().unwrap(), is_nullable),
+                Datatype::String => nullable_value!(v, is_nullable),
+                Datatype::Boolean => nullable_value!(v.parse::<bool>().unwrap(), is_nullable),
+                Datatype::Bytes => unreachable!(),
+            };
+            Ok(value)
         }
         ValueRef::Blob(v) => {
-            if is_nullable {
-                Arc::new(Some(v.to_vec()))
-            } else {
-                Arc::new(v.to_vec())
-            }
+            let v = v.to_vec();
+            Ok(match ty {
+                Datatype::String => nullable_value!(String::from_utf8(v).unwrap(), is_nullable),
+                Datatype::Bytes => nullable_value!(v, is_nullable),
+                _ => {
+                    return Err(Error::ModuleError(format!(
+                        "unsupported value: {:#?} cast to: {:#?}",
+                        v, ty
+                    )))
+                }
+            })
         }
     }
 }
@@ -592,12 +632,12 @@ pub(crate) mod tests {
 
         db.execute_batch(
             "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
-                    create_sql='create table tonbo(id bigint primary key, name varchar, like bigint)',
+                    create_sql='create table tonbo(id bigint primary key, name varchar, like int)',
                     path = './db_path/test',
             );",
         )?;
         db.execute(
-            "INSERT INTO tonbo (id, name, like) VALUES (0, 'lol', 0)",
+            "INSERT INTO tonbo (id, name, like) VALUES (0, 'lol', '0')",
             [],
         )?;
         let mut stmt = db.prepare("SELECT * FROM tonbo;")?;
@@ -618,7 +658,7 @@ pub(crate) mod tests {
 
         db.execute_batch(
             "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
-                    create_sql='create table tonbo(id bigint primary key, name varchar, like bigint)',
+                    create_sql='create table tonbo(id bigint primary key, name varchar, like int)',
                     path = './db_path/test_s3',
                     bucket = 'data',
                     key_id = 'user',
