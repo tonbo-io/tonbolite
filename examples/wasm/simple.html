@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Title</title>
+  </head>
+  <body>
+  </body>
+  <script type="module">
+    import init, { Connection } from "../../pkg/sqlite_tonbo.js";
+
+    await init();
+
+    const conn = Connection.open();
+
+    await conn.execute_batch(
+      "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(" +
+        "id='int primary key'," +
+        "name='varchar nullable'," +
+        "like='int nullable'" +
+        ");",
+    );
+    await conn.execute(
+      "INSERT INTO tonbo (id, name, like) VALUES (0, 'lol', 0)",
+    );
+    await conn.execute(
+      "INSERT INTO tonbo (id, name, like) VALUES (1, 'tonbo', 12)",
+    );
+    await conn.select("SELECT * FROM tonbo;");
+  </script>
+</html>
