@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use rusqlite::types::ValueRef;
 use rusqlite::vtab::{
     parse_boolean, update_module, Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection,
-    VTabCursor, VTabKind, Values,
+    VTabCursor, VTabKind, ValueIter, Values,
 };
 use rusqlite::{ffi, vtab, Connection, Error};
 use sqlparser::ast::{ColumnOption, DataType, Statement};
@@ -245,6 +245,49 @@ impl TonboTable {
             },
         ))
     }
+
+    fn _remove(&mut self, pk: i64) -> Result<(), Error> {
+        let desc = &self.column_desc[self.primary_key_index];
+        let value = Column::new(
+            desc.datatype,
+            desc.name.clone(),
+            Arc::new(pk),
+            desc.is_nullable,
+        );
+
+        self.state
+            .executor
+            .block_on(async { self.database.remove(value).await })
+            .map_err(|err| Error::ModuleError(err.to_string()))?;
+        Ok(())
+    }
+
+    fn _insert(&mut self, args: ValueIter) -> Result<i64, Error> {
+        let mut id = None;
+        let mut values = Vec::with_capacity(self.column_desc.len());
+
+        for (i, (desc, value)) in self.column_desc.iter().zip(args).enumerate() {
+            if i == self.primary_key_index {
+                id = Some(value);
+            }
+            values.push(Column::new(
+                desc.datatype,
+                desc.name.clone(),
+                value_trans(value, &desc.datatype, desc.is_nullable)?,
+                desc.is_nullable,
+            ));
+        }
+
+        self.state
+            .executor
+            .block_on(async {
+                self.database
+                    .insert(DynRecord::new(values, self.primary_key_index))
+                    .await
+            })
+            .map_err(|err| Error::ModuleError(err.to_string()))?;
+        Ok(id.unwrap().as_i64()?)
+    }
 }
 
 unsafe impl<'vtab> VTab<'vtab> for TonboTable {
@@ -288,9 +331,9 @@ unsafe impl<'vtab> VTab<'vtab> for TonboTable {
 
                 while let Some(result) = stream.next().await {
                     let entry = result.unwrap();
-                    let value = entry.value().unwrap();
-
-                    let _ = tuple_tx.send(Some((value.columns, value.primary_index)));
+                    if let Some(value) = entry.value() {
+                        let _ = tuple_tx.send(Some((value.columns, value.primary_index)));
+                    }
                 }
                 let _ = tuple_tx.send(None);
             }
@@ -342,8 +385,10 @@ impl RecordCursor<'_> {
 }
 
 impl UpdateVTab<'_> for TonboTable {
-    fn delete(&mut self, _: ValueRef<'_>) -> rusqlite::Result<()> {
-        todo!()
+    fn delete(&mut self, arg: ValueRef<'_>) -> rusqlite::Result<()> {
+        self._remove(arg.as_i64().unwrap())?;
+
+        Ok(())
     }
 
     fn insert(&mut self, args: &Values<'_>) -> rusqlite::Result<i64> {
@@ -352,34 +397,21 @@ impl UpdateVTab<'_> for TonboTable {
         let _ = args.next();
         let _ = args.next();
 
-        let mut id = None;
-        let mut values = Vec::with_capacity(self.column_desc.len());
-
-        for (i, (desc, value)) in self.column_desc.iter().zip(args).enumerate() {
-            if i == self.primary_key_index {
-                id = Some(value);
-            }
-            values.push(Column::new(
-                desc.datatype,
-                desc.name.clone(),
-                value_trans(value, &desc.datatype, desc.is_nullable)?,
-                desc.is_nullable,
-            ));
-        }
-
-        self.state
-            .executor
-            .block_on(async {
-                self.database
-                    .insert(DynRecord::new(values, self.primary_key_index))
-                    .await
-            })
-            .map_err(|err| Error::ModuleError(err.to_string()))?;
-        Ok(id.unwrap().as_i64()?)
+        self._insert(args)
     }
 
-    fn update(&mut self, _: &Values<'_>) -> rusqlite::Result<()> {
-        todo!()
+    fn update(&mut self, args: &Values<'_>) -> rusqlite::Result<()> {
+        let mut args = args.iter();
+        let _ = args.next();
+        let Some(old_pk) = args.next().map(|v| v.as_i64().unwrap()) else {
+            return Ok(());
+        };
+        let new_pk = self._insert(args)?;
+        if new_pk != old_pk {
+            self._remove(old_pk)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -636,15 +668,45 @@ pub(crate) mod tests {
                     path = './db_path/test',
             );",
         )?;
-        db.execute(
-            "INSERT INTO tonbo (id, name, like) VALUES (0, 'lol', '0')",
-            [],
-        )?;
+        for i in 0..3 {
+            db.execute(
+                &format!("INSERT INTO tonbo (id, name, like) VALUES ({i}, 'lol', {i})"),
+                [],
+            )?;
+        }
         let mut stmt = db.prepare("SELECT * FROM tonbo;")?;
         let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            println!("{:#?}", row);
-        }
+        let row = rows.next()?.unwrap();
+        assert_eq!(row.get_ref_unwrap(0).as_i64().unwrap(), 0);
+        assert_eq!(row.get_ref_unwrap(1).as_str().unwrap(), "lol");
+        assert_eq!(row.get_ref_unwrap(2).as_i64().unwrap(), 0);
+        let row = rows.next()?.unwrap();
+        assert_eq!(row.get_ref_unwrap(0).as_i64().unwrap(), 1);
+        assert_eq!(row.get_ref_unwrap(1).as_str().unwrap(), "lol");
+        assert_eq!(row.get_ref_unwrap(2).as_i64().unwrap(), 1);
+        let row = rows.next()?.unwrap();
+        assert_eq!(row.get_ref_unwrap(0).as_i64().unwrap(), 2);
+        assert_eq!(row.get_ref_unwrap(1).as_str().unwrap(), "lol");
+        assert_eq!(row.get_ref_unwrap(2).as_i64().unwrap(), 2);
+        assert!(rows.next()?.is_none());
+
+        db.execute(
+            "UPDATE tonbo SET name = ?1, like = ?2, id = 4 WHERE id = ?3",
+            ["ioi", "9", "0"],
+        )?;
+        let mut stmt = db.prepare("SELECT * FROM tonbo where id = ?1 or id = ?2;")?;
+        let mut rows = stmt.query(["0", "4"])?;
+
+        let row = rows.next()?.unwrap();
+        assert_eq!(row.get_ref_unwrap(0).as_i64().unwrap(), 4);
+        assert_eq!(row.get_ref_unwrap(1).as_str().unwrap(), "ioi");
+        assert_eq!(row.get_ref_unwrap(2).as_i64().unwrap(), 9);
+        assert!(rows.next()?.is_none());
+
+        db.execute("DELETE from tonbo WHERE id = ?1", ["2"])?;
+        let mut stmt = db.prepare("SELECT * FROM tonbo where id = ?1;")?;
+        let mut rows = stmt.query(["2"])?;
+        assert!(rows.next()?.is_none());
 
         Ok(())
     }
