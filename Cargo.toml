@@ -11,8 +11,11 @@ flume = "0.11"
 fusio = { git = "https://github.com/tonbo-io/fusio.git", rev = "8038993675591f87dd65b88ffdade31dc0a254b7", package = "fusio", features = [
     "dyn",
     "fs",
+    "aws"
 ] }
+fusio-dispatch = { git = "https://github.com/tonbo-io/fusio.git", rev = "8038993675591f87dd65b88ffdade31dc0a254b7", package = "fusio-dispatch", features = ["aws"] }
 futures-util = "0.3"
+sqlparser = "0.52"
 tokio = { version = "1.41", features = ["rt-multi-thread"] }
 tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "4844cb8409a48b680467705bb05cbcac2edcb8c6", package = "tonbo" }
 tonbo_macros = { git = "https://github.com/tonbo-io/tonbo", rev = "4844cb8409a48b680467705bb05cbcac2edcb8c6", package = "tonbo_macros" }
