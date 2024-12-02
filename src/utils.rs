@@ -35,9 +35,9 @@ pub(crate) fn parse_type(input: &str) -> rusqlite::Result<(Datatype, bool, bool)
 macro_rules! nullable_value {
     ($value:expr, $is_nullable:expr) => {
         if $is_nullable {
-            Arc::new(Some($value)) as Arc<dyn Any>
+            Arc::new(Some($value)) as Arc<dyn Any + Send + Sync>
         } else {
-            Arc::new($value) as Arc<dyn Any>
+            Arc::new($value) as Arc<dyn Any + Send + Sync>
         }
     };
 }
@@ -47,7 +47,7 @@ pub(crate) fn value_trans(
     value: ValueRef<'_>,
     ty: &Datatype,
     is_nullable: bool,
-) -> rusqlite::Result<Arc<dyn Any>> {
+) -> rusqlite::Result<Arc<dyn Any + Send + Sync>> {
     match value {
         ValueRef::Null => {
             if !is_nullable {

@@ -5,7 +5,8 @@ use fusio::path::Path;
 use futures_util::StreamExt;
 use rusqlite::types::ValueRef;
 use rusqlite::vtab::{
-    Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor, VTabKind, Values,
+    Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor, VTabKind,
+    ValueIter, Values,
 };
 use rusqlite::{ffi, vtab, Error};
 use std::ffi::c_int;
@@ -14,6 +15,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 use tonbo::record::runtime::Datatype;
 use tonbo::record::{Column, ColumnDesc, DynRecord};
+use tonbo::transaction::CommitError;
 use tonbo::{DbOption, DB};
 
 pub(crate) enum Task {
@@ -24,6 +26,10 @@ pub(crate) enum Task {
     Select {
         sender: Sender<()>,
         range: (Bound<Column>, Bound<Column>),
+    },
+    Delete {
+        sender: Sender<rusqlite::Result<()>>,
+        key: Column,
     },
 }
 
@@ -126,11 +132,20 @@ impl TonboTable {
 
                             while let Some(result) = stream.next().await {
                                 let entry = result.unwrap();
-                                let value = entry.value().unwrap();
-
-                                let _ = tuple_tx.send(Some((value.columns, value.primary_index)));
+                                if let Some(value) = entry.value() {
+                                    let _ =
+                                        tuple_tx.send(Some((value.columns, value.primary_index)));
+                                }
                             }
                             let _ = tuple_tx.send(None);
+                        }
+                        Task::Delete { sender, key } => {
+                            match database.remove(key).await {
+                                Ok(_) => sender.send(Ok(())).unwrap(),
+                                Err(err) => sender
+                                    .send(Err(Error::ModuleError(err.to_string())))
+                                    .unwrap(),
+                            };
                         }
                     }
                 }
@@ -148,6 +163,47 @@ impl TonboTable {
                 tuple_rx,
             },
         ))
+    }
+
+    fn _remove(&mut self, pk: i64) -> Result<(), Error> {
+        let desc = &self.column_desc[self.primary_key_index];
+        let key = Column::new(
+            desc.datatype,
+            desc.name.clone(),
+            Arc::new(pk),
+            desc.is_nullable,
+        );
+
+        let (sender, receiver) = flume::bounded(1);
+
+        self.req_tx.send(Task::Delete { sender, key }).unwrap();
+        receiver.recv().unwrap()?;
+        Ok(())
+    }
+
+    fn _insert(&mut self, args: ValueIter) -> Result<i64, Error> {
+        let mut id = None;
+        let mut values = Vec::with_capacity(self.column_desc.len());
+
+        for (i, (desc, value)) in self.column_desc.iter().zip(args).enumerate() {
+            if i == self.primary_key_index {
+                id = Some(value);
+            }
+            values.push(Column::new(
+                desc.datatype,
+                desc.name.clone(),
+                value_trans(value, &desc.datatype, desc.is_nullable)?,
+                desc.is_nullable,
+            ));
+        }
+        let record = DynRecord::new(values, self.primary_key_index);
+
+        let (sender, receiver) = flume::bounded(1);
+
+        self.req_tx.send(Task::Insert { sender, record }).unwrap();
+        receiver.recv().unwrap();
+
+        Ok(id.unwrap().as_i64()?)
     }
 }
 
@@ -214,8 +270,20 @@ impl RecordCursor<'_> {
 }
 
 impl UpdateVTab<'_> for TonboTable {
-    fn delete(&mut self, _: ValueRef<'_>) -> rusqlite::Result<()> {
-        todo!()
+    fn delete(&mut self, arg: ValueRef<'_>) -> rusqlite::Result<()> {
+        let desc = &self.column_desc[self.primary_key_index];
+        let key = Column::new(
+            desc.datatype,
+            desc.name.clone(),
+            Arc::new(arg.as_i64().unwrap()),
+            desc.is_nullable,
+        );
+        let (sender, receiver) = flume::bounded(1);
+
+        self.req_tx.send(Task::Delete { sender, key }).unwrap();
+        receiver.recv().unwrap()?;
+
+        Ok(())
     }
 
     fn insert(&mut self, args: &Values<'_>) -> rusqlite::Result<i64> {
@@ -224,36 +292,21 @@ impl UpdateVTab<'_> for TonboTable {
         let _ = args.next();
         let _ = args.next();
 
-        let mut id = None;
-        let values = self
-            .column_desc
-            .iter()
-            .zip(args)
-            .enumerate()
-            .map(|(i, (desc, value))| {
-                if i == self.primary_key_index {
-                    id = Some(value);
-                }
-                Column::new(
-                    desc.datatype,
-                    desc.name.clone(),
-                    value_trans(value, &desc.datatype, desc.is_nullable).unwrap(),
-                    desc.is_nullable,
-                )
-            })
-            .collect();
-        let record = DynRecord::new(values, self.primary_key_index);
-
-        let (sender, receiver) = flume::bounded(1);
-
-        self.req_tx.send(Task::Insert { sender, record }).unwrap();
-        receiver.recv().unwrap();
-
-        Ok(id.unwrap().as_i64()?)
+        self._insert(args)
     }
 
-    fn update(&mut self, _: &Values<'_>) -> rusqlite::Result<()> {
-        todo!()
+    fn update(&mut self, args: &Values<'_>) -> rusqlite::Result<()> {
+        let mut args = args.iter();
+        let _ = args.next();
+        let Some(old_pk) = args.next().map(|v| v.as_i64().unwrap()) else {
+            return Ok(());
+        };
+        let new_pk = self._insert(args)?;
+        if new_pk != old_pk {
+            self._remove(old_pk)?;
+        }
+
+        Ok(())
     }
 }
 

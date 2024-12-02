@@ -1,10 +1,25 @@
 use crate::load_module;
+use flume::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
 pub struct Connection {
     conn: Arc<Mutex<rusqlite::Connection>>,
+}
+
+impl Connection {
+    async fn execute_inner(&self, sql: String) -> Result<usize, JsValue> {
+        let conn = self.conn.clone();
+        let count = wasm_thread::Builder::new()
+            .spawn(|| async move { conn.lock().unwrap().execute(&sql, []).unwrap() })
+            .unwrap()
+            .join_async()
+            .await
+            .unwrap();
+
+        Ok(count)
+    }
 }
 
 #[wasm_bindgen]
@@ -29,15 +44,17 @@ impl Connection {
     pub async fn execute(&self, sql: String) -> Result<usize, JsValue> {
         // TODO: Handling `CREATE` sql
 
-        let conn = self.conn.clone();
-        let count = wasm_thread::Builder::new()
-            .spawn(|| async move { conn.lock().unwrap().execute(&sql, []).unwrap() })
-            .unwrap()
-            .join_async()
-            .await
-            .unwrap();
+        self.execute_inner(sql).await
+    }
 
-        Ok(count)
+    /// Convenience method to execute a single `CREATE` SQL statement.
+    pub async fn create(&self, sql: String) -> Result<usize, JsValue> {
+        Ok(self.conn.lock().unwrap().execute(&sql, []).unwrap())
+    }
+
+    /// Convenience method to execute a single `INSERT` SQL statement.
+    pub async fn insert(&self, sql: String) -> Result<usize, JsValue> {
+        self.execute_inner(sql).await
     }
 
     /// Convenience method to prepare and execute a single select SQL statement.
@@ -45,12 +62,12 @@ impl Connection {
         let conn = self.conn.clone();
         wasm_thread::Builder::new()
             .spawn(|| async move {
-                log::info!("execute \"{}\"", sql.clone());
                 let db = conn.lock().unwrap();
 
                 let mut stmt = db.prepare(&sql).unwrap();
                 let mut rows = stmt.query([]).unwrap();
                 while let Some(row) = rows.next().unwrap() {
+                    // TODO: row binding
                     log::info!("{:#?}", row);
                 }
             })
@@ -58,5 +75,15 @@ impl Connection {
             .join_async()
             .await
             .unwrap();
+    }
+
+    /// Convenience method to execute a single `DELETE` SQL statement.
+    pub async fn delete(&self, sql: String) -> Result<usize, JsValue> {
+        self.execute_inner(sql).await
+    }
+
+    /// Convenience method to execute a single `UPDATE` SQL statement.
+    pub async fn update(&self, sql: String) -> Result<usize, JsValue> {
+        self.execute_inner(sql).await
     }
 }
