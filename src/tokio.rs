@@ -5,12 +5,14 @@ use fusio::path::Path;
 use fusio_dispatch::FsOptions;
 use futures_util::StreamExt;
 use rusqlite::types::ValueRef;
-use rusqlite::vtab::{parse_boolean, update_module, Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor, VTabKind, ValueIter, Values};
+use rusqlite::vtab::{
+    parse_boolean, update_module, Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection,
+    VTabCursor, VTabKind, ValueIter, Values,
+};
 use rusqlite::{ffi, vtab, Connection, Error};
 use sqlparser::ast::{ColumnOption, DataType, Statement};
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
-use std::any::Any;
 use std::collections::Bound;
 use std::ffi::c_int;
 use std::marker::PhantomData;

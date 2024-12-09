@@ -20,7 +20,7 @@ use crate::tokio::{DbState, TonboTable};
 #[cfg(feature = "wasm")]
 use crate::wasm::{DbState, TonboTable};
 
-pub(crate) fn load_module(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+pub fn load_module(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let _ = fs::create_dir_all("./db_path/tonbo");
 
     let aux = Some(Arc::new(DbState::new()));
