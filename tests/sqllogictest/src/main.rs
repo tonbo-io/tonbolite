@@ -25,6 +25,10 @@ fn main() {
         std::env::set_current_dir(temp_dir.path()).unwrap();
 
         create_dir_all("./tonbo_test").unwrap();
+        // for select 4
+        for i in 1..10 {
+            create_dir_all(format!("./tonbo_test/t{i}",)).unwrap();
+        }
 
         let filepath = slt_file.expect("failed to read test file");
         let mut tester = Runner::new(
