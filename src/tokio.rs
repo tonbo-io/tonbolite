@@ -348,7 +348,7 @@ pub(crate) mod tests {
                     addr = 'http://[::1]:50051',
             );",
         )?;
-        for i in 0..2 {
+        for i in 0..3 {
             db.execute(
                 &format!("INSERT INTO tonbo (id, name, like) VALUES ({i}, 'lol', {i})"),
                 [],
