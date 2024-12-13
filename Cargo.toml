@@ -19,20 +19,17 @@ wasm = [
 
 [dependencies]
 flume = "0.11"
-fusio = { path = "../fusio/fusio", package = "fusio", features = [
+fusio = { git = "https://github.com/tonbo-io/fusio.git", rev = "216eb446fb0a0c6e5e85bfac51a6f6ed8e5ed606", package = "fusio", features = [
     "dyn",
     "fs",
     "aws",
 ] }
-fusio-dispatch = { path = "../fusio/fusio-dispatch", package = "fusio-dispatch", features = ["aws"] }
 futures-util = "0.3"
 tokio = { version = "1.41", optional = true, features = ["rt-multi-thread"] }
-tonbo = { path = "../yet-another-elsm", package = "tonbo", default-features = false, features = [
+tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "f6e005e88b478c6063d61b867645e4683ef0658c", package = "tonbo", default-features = false, features = [
     "bytes",
 ], optional = true }
-tonbo_net_client = { path = "../yet-another-elsm/tonbo_net_client", package = "tonbo_net_client" }
-
-tonbo_macros = { git = "https://github.com/tonbo-io/tonbo", rev = "4844cb8409a48b680467705bb05cbcac2edcb8c6", package = "tonbo_macros" }
+tonbo_net_client = { git = "https://github.com/tonbo-io/tonbo", rev = "f6e005e88b478c6063d61b867645e4683ef0658c", package = "tonbo_net_client" }
 rusqlite = { git = "https://github.com/tonbo-io/rusqlite", branch = "wasm32-unknown-unknown", features = [
     "vtab",
     "bundled",
