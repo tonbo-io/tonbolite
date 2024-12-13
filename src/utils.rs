@@ -1,11 +1,13 @@
 use rusqlite::types::ValueRef;
 use rusqlite::vtab::Context;
 use rusqlite::Error;
-use sqlparser::ast::DataType;
+use sqlparser::ast::{ColumnOption, DataType, Statement};
+use sqlparser::parser::Parser;
 use std::any::Any;
 use std::sync::Arc;
-use tonbo::record::{Column, Datatype};
+use tonbo::record::{Column, ColumnDesc, Datatype};
 
+#[allow(unused)]
 pub(crate) fn parse_type(input: &str) -> rusqlite::Result<(Datatype, bool, bool)> {
     let input = input.trim();
 
@@ -231,4 +233,61 @@ pub(crate) fn type_trans(ty: &DataType) -> Datatype {
         DataType::Varchar(_) => Datatype::String,
         _ => todo!(),
     }
+}
+
+#[allow(unused)]
+pub(crate) fn parse_create_sql_params(
+    value: &str,
+) -> rusqlite::Result<(Vec<ColumnDesc>, Option<usize>)> {
+    let mut primary_key_index = None;
+    let mut descs = Vec::new();
+    let dialect = sqlparser::dialect::MySqlDialect {};
+
+    if let Statement::CreateTable(create_table) =
+        &Parser::parse_sql(&dialect, value).map_err(|err| Error::ModuleError(err.to_string()))?[0]
+    {
+        for (i, column_def) in create_table.columns.iter().enumerate() {
+            let name = column_def.name.value.to_ascii_lowercase();
+            let datatype = type_trans(&column_def.data_type);
+            let mut is_not_nullable = column_def
+                .options
+                .iter()
+                .any(|option| matches!(option.option, ColumnOption::NotNull));
+            let is_primary_key = column_def.options.iter().any(|option| {
+                matches!(
+                    option.option,
+                    ColumnOption::Unique {
+                        is_primary: true,
+                        ..
+                    }
+                )
+            });
+            if is_primary_key {
+                if primary_key_index.is_some() {
+                    return Err(Error::ModuleError(
+                        "the primary key must exist and only one is allowed".to_string(),
+                    ));
+                }
+                if datatype != Datatype::Int64 {
+                    return Err(Error::ModuleError(
+                        "the primary key must be of int type".to_string(),
+                    ));
+                }
+                is_not_nullable = true;
+                primary_key_index = Some(i)
+            }
+            descs.push(ColumnDesc::new(name, datatype, !is_not_nullable));
+        }
+    } else {
+        return Err(Error::ModuleError(format!(
+            "`CreateTable` SQL syntax error: '{value}'"
+        )));
+    }
+    if primary_key_index.is_none() {
+        return Err(Error::ModuleError(
+            "the primary key must exist and only one is allowed".to_string(),
+        ));
+    };
+
+    Ok((descs, primary_key_index))
 }

@@ -1,4 +1,5 @@
 use crate::load_module;
+use flume::{Receiver, Sender};
 use js_sys::Object;
 use rusqlite::types::{FromSql, FromSqlResult, ValueRef};
 use std::fmt::Debug;
@@ -9,6 +10,8 @@ use wasm_bindgen_futures::js_sys;
 #[wasm_bindgen]
 pub struct Connection {
     conn: Arc<Mutex<rusqlite::Connection>>,
+    req_tx: Option<Sender<String>>,
+    resp_rx: Option<Receiver<usize>>,
 }
 
 impl Connection {
@@ -32,26 +35,38 @@ impl Connection {
         load_module(&conn).unwrap();
         Self {
             conn: Arc::new(Mutex::new(conn)),
+            req_tx: None,
+            resp_rx: None,
         }
     }
 
-    /// Convenience method to prepare and execute a single SQL statement.
-    ///
-    /// On success, returns the number of rows that were changed or inserted or deleted
-    pub async fn execute(&self, sql: String) -> Result<usize, JsValue> {
-        // TODO: Handling `CREATE` sql
-
-        self.execute_inner(sql).await
-    }
-
     /// Convenience method to execute a single `CREATE` SQL statement.
-    pub async fn create(&self, sql: String) -> Result<usize, JsValue> {
-        Ok(self.conn.lock().unwrap().execute(&sql, []).unwrap())
+    pub async fn create(&mut self, sql: String) -> Result<usize, JsValue> {
+        let res = { self.conn.lock().unwrap().execute(&sql, []).unwrap() };
+
+        let (req_tx, req_rx) = flume::bounded(1);
+        let (resp_tx, resp_rx) = flume::bounded(1);
+        self.req_tx = Some(req_tx);
+        self.resp_rx = Some(resp_rx);
+        let conn = self.conn.clone();
+        wasm_thread::Builder::new()
+            .spawn(move || async move {
+                while let Ok(sql) = req_rx.recv() {
+                    let res = conn.lock().unwrap().execute(&sql, []).unwrap();
+                    resp_tx.send(res).unwrap();
+                }
+            })
+            .unwrap();
+        Ok(res)
     }
 
     /// Convenience method to execute a single `INSERT` SQL statement.
     pub async fn insert(&self, sql: String) -> Result<usize, JsValue> {
-        self.execute_inner(sql).await
+        self.req_tx.as_ref().unwrap().send_async(sql).await.unwrap();
+        let count = self.resp_rx.as_ref().unwrap().recv_async().await.unwrap();
+
+        Ok(count)
+        // self.execute_inner(sql).await
     }
 
     /// Convenience method to prepare and execute a single select SQL statement.
@@ -100,6 +115,27 @@ impl Connection {
     pub async fn update(&self, sql: String) -> Result<usize, JsValue> {
         self.execute_inner(sql).await
     }
+
+    /// Flush data to stable storage.
+    pub async fn flush(&self, table: String) {
+        let conn = self.conn.clone();
+        wasm_thread::Builder::new()
+            .spawn(|| async move {
+                conn.lock()
+                    .unwrap()
+                    .pragma(
+                        None,
+                        "quick_check",
+                        table.as_str(),
+                        |_r| -> rusqlite::Result<()> { Ok(()) },
+                    )
+                    .unwrap()
+            })
+            .unwrap()
+            .join_async()
+            .await
+            .unwrap();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -142,11 +178,9 @@ impl FromSql for JsColumn {
         let value = match value {
             ValueRef::Null => Value::Null,
             ValueRef::Integer(i) => Value::Integer(i),
-            ValueRef::Real(f) => {
-                todo!()
-            }
+            ValueRef::Real(f) => Value::Real(f),
             ValueRef::Text(s) => Value::Text(String::from_utf8_lossy(s).to_string()),
-            ValueRef::Blob(b) => {
+            ValueRef::Blob(_b) => {
                 todo!()
             }
         };
@@ -180,4 +214,75 @@ impl From<JsRow> for JsValue {
         }
         object.into()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    use crate::Connection;
+    use rusqlite::fallible_iterator::FallibleIterator;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    async fn test_write() {
+        let mut conn = Connection::open();
+        conn.create(
+            "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
+                    create_sql='create table tonbo(id bigint primary key, name varchar, like int)',
+                    path='db_path/test'
+            );"
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        for i in 0..1000 {
+            // if i % 5 == 0 {
+            //     conn.flush("tonbo".to_string()).await;
+            // }
+            conn.insert(format!(
+                "INSERT INTO tonbo (id, name, like) VALUES ({i}, '{i}', {i})"
+            ))
+            .await
+            .unwrap();
+        }
+    }
+
+    // #[ignore]
+    // #[wasm_bindgen_test]
+    // async fn test_write_s3() {
+    //     if option_env!("AWS_ACCESS_KEY_ID").is_none() {
+    //         return;
+    //     }
+    //     let key_id = option_env!("AWS_ACCESS_KEY_ID").unwrap().to_string();
+    //     let secret_key = option_env!("AWS_SECRET_ACCESS_KEY").unwrap().to_string();
+    //
+    //     let mut conn = Connection::open();
+    //     conn.create(format!(
+    //         "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
+    //                 create_sql='create table tonbo(id bigint primary key, name varchar, like int)',
+    //                 path = 'sqlite-tonbo',
+    //                 bucket = 'wasm-data',
+    //                 key_id = {key_id},
+    //                 secret_key = {secret_key},
+    //                 region = 'ap-southeast-2',
+    //                 fs=s3,
+    //                 s3_url='sqlite-tonbo'
+    //         );"
+    //     ))
+    //     .await
+    //     .unwrap();
+    //
+    //     for i in 0..100 {
+    //         if i % 5 == 0 {
+    //             conn.flush("tonbo".to_string()).await;
+    //         }
+    //         conn.insert(format!(
+    //             "INSERT INTO tonbo (id, name, like) VALUES ({i}, '{i}', {i})"
+    //         ))
+    //         .await
+    //         .unwrap();
+    //     }
+    // }
 }

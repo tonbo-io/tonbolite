@@ -1,21 +1,20 @@
 use crate::executor::SQLiteExecutor;
-use crate::utils::{parse_type, set_result, value_trans};
+use crate::utils::{parse_create_sql_params, set_result, value_trans};
 use flume::{Receiver, Sender};
 use fusio::path::Path;
+use fusio_dispatch::FsOptions;
 use futures_util::StreamExt;
 use rusqlite::types::ValueRef;
 use rusqlite::vtab::{
-    Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor, VTabKind,
-    ValueIter, Values,
+    parse_boolean, Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor,
+    VTabKind, ValueIter, Values,
 };
 use rusqlite::{ffi, vtab, Error};
 use std::ffi::c_int;
 use std::marker::PhantomData;
 use std::ops::Bound;
 use std::sync::Arc;
-use tonbo::record::runtime::Datatype;
 use tonbo::record::{Column, ColumnDesc, DynRecord};
-use tonbo::transaction::CommitError;
 use tonbo::{DbOption, DB};
 
 pub(crate) enum Task {
@@ -30,6 +29,9 @@ pub(crate) enum Task {
     Delete {
         sender: Sender<rusqlite::Result<()>>,
         key: Column,
+    },
+    Flush {
+        sender: Sender<rusqlite::Result<()>>,
     },
 }
 
@@ -50,6 +52,12 @@ pub struct TonboTable {
     column_desc: Vec<ColumnDesc>,
     req_tx: Sender<Task>,
     tuple_rx: Receiver<Option<(Vec<Column>, usize)>>,
+    handle: wasm_thread::JoinHandle<()>,
+}
+
+enum FsType {
+    Local,
+    S3,
 }
 
 impl TonboTable {
@@ -62,47 +70,128 @@ impl TonboTable {
         let mut primary_key_index = None;
         let mut descs = Vec::new();
         let mut fields = Vec::with_capacity(args.len());
+        let mut schema = None;
+        let mut fs_option = FsType::Local;
+        // Local
+        let mut path = None;
+        // S3
+        let mut s3_url = None;
+        let mut bucket = None;
+        let mut key_id = None;
+        let mut secret_key = None;
+        let mut token = None;
+        let mut endpoint = None;
+        let mut region = None;
+        let mut sign_payload = None;
+        let mut checksum = None;
 
-        let mut i = 0;
+        let args = &args[3..];
         for c_slice in args.iter() {
-            let Ok((param, value)) = vtab::parameter(c_slice) else {
-                continue;
-            };
-            let (ty, is_nullable, is_primary_key) = parse_type(value)?;
+            let (param, value) = vtab::parameter(c_slice)?;
 
-            if is_primary_key {
-                if primary_key_index.is_some() {
-                    return Err(Error::ModuleError(
-                        "the primary key must exist and only one is allowed".to_string(),
-                    ));
+            match param {
+                "create_sql" => {
+                    if schema.is_some() {
+                        return Err(Error::ModuleError("`create_sql` duplicate".to_string()));
+                    }
+                    schema = Some(value.to_string());
+
+                    (descs, primary_key_index) = parse_create_sql_params(value)?;
                 }
-                primary_key_index = Some(i)
+                "fs" => match value {
+                    "local" => fs_option = FsType::Local,
+                    "s3" => fs_option = FsType::S3,
+                    _ => {
+                        return Err(Error::ModuleError(format!(
+                            "unrecognized fs type '{param}'"
+                        )))
+                    }
+                },
+                "s3_url" => s3_url = Some(value.to_string()),
+                "key_id" => key_id = Some(value.to_string()),
+                "secret_key" => secret_key = Some(value.to_string()),
+                "token" => token = Some(value.to_string()),
+                "bucket" => bucket = Some(value.to_string()),
+                "path" => path = Some(value.to_string()),
+                "endpoint" => endpoint = Some(value.to_string()),
+                "region" => region = Some(value.to_string()),
+                "sign_payload" => sign_payload = parse_boolean(value),
+                "checksum" => checksum = parse_boolean(value),
+                _ => {
+                    return Err(Error::ModuleError(format!(
+                        "unrecognized parameter '{param}'"
+                    )));
+                }
             }
 
             fields.push(format!("{} {}", param, value));
-            descs.push(ColumnDesc::new(param.to_string(), ty, is_nullable));
-            i += 1;
         }
         let primary_key_index = primary_key_index.ok_or_else(|| {
             Error::ModuleError("the primary key must exist and only one is allowed".to_string())
         })?;
-        if descs[primary_key_index].datatype != Datatype::Int64 {
-            return Err(Error::ModuleError(
-                "the primary key must be of int type".to_string(),
-            ));
+        let path = Path::from_opfs_path(
+            path.ok_or_else(|| Error::ModuleError("`path` not found".to_string()))?,
+        )
+        .map_err(|err| Error::ModuleError(format!("path parser error: {err}")))?;
+        let fs_option = match fs_option {
+            FsType::Local => FsOptions::Local,
+            FsType::S3 => {
+                let mut credential = None;
+                if key_id.is_some() || secret_key.is_some() || token.is_some() {
+                    credential = Some(fusio::remotes::aws::AwsCredential {
+                        key_id: key_id
+                            .ok_or_else(|| Error::ModuleError("`key_id` not found".to_string()))?,
+                        secret_key: secret_key.ok_or_else(|| {
+                            Error::ModuleError("`secret_key` not found".to_string())
+                        })?,
+                        token,
+                    });
+                }
+                FsOptions::S3 {
+                    bucket: bucket
+                        .ok_or_else(|| Error::ModuleError("`bucket` not found".to_string()))?,
+                    credential,
+                    endpoint,
+                    region,
+                    sign_payload,
+                    checksum,
+                }
+            }
+        };
+
+        let mut options = DbOption::with_path(
+            path,
+            descs[primary_key_index].name.clone(),
+            primary_key_index,
+        );
+        // .disable_wal();
+        if matches!(fs_option, FsOptions::S3 { .. }) {
+            let url = s3_url.ok_or_else(|| Error::ModuleError("`s3_url` not found".to_string()))?;
+            let url = Path::from_url_path(url)
+                .map_err(|err| Error::ModuleError(format!("path parser error: {err}")))?;
+            options = options
+                // TODO: We can add an option user to set all SSTables to use the same URL.
+                .level_path(0, url.clone(), fs_option.clone())
+                .unwrap()
+                .level_path(1, url.clone(), fs_option.clone())
+                .unwrap()
+                .level_path(2, url.clone(), fs_option.clone())
+                .unwrap()
+                .level_path(3, url.clone(), fs_option.clone())
+                .unwrap()
+                .level_path(4, url.clone(), fs_option.clone())
+                .unwrap()
+                .level_path(5, url.clone(), fs_option.clone())
+                .unwrap()
+                .level_path(6, url, fs_option.clone())
+                .unwrap();
         }
         let descs_clone = descs.clone();
-        let (req_tx, req_rx): (Sender<Task>, _) = flume::bounded(1);
+        let (req_tx, req_rx): (Sender<Task>, _) = flume::bounded(100);
 
         let (tuple_tx, tuple_rx): (Sender<Option<(Vec<Column>, usize)>>, _) = flume::bounded(10);
-        wasm_thread::Builder::new()
+        let handle = wasm_thread::Builder::new()
             .spawn(move || async move {
-                let options = DbOption::with_path(
-                    Path::from_opfs_path("db_path/tonbo").unwrap(),
-                    descs_clone[primary_key_index].name.clone(),
-                    primary_key_index,
-                );
-
                 let executor = SQLiteExecutor::new();
                 let database = DB::with_schema(options, executor, descs_clone, primary_key_index)
                     .await
@@ -147,13 +236,17 @@ impl TonboTable {
                                     .unwrap(),
                             };
                         }
+                        Task::Flush { sender } => {
+                            database.flush().await.unwrap();
+                            sender.send(Ok(())).unwrap();
+                        }
                     }
                 }
             })
             .unwrap();
 
         Ok((
-            format!("CREATE TABLE tonbo({})", fields.join(", ")),
+            schema.unwrap(),
             Self {
                 base: ffi::sqlite3_vtab::default(),
                 state: aux.unwrap().clone(),
@@ -161,6 +254,7 @@ impl TonboTable {
                 column_desc: descs,
                 req_tx,
                 tuple_rx,
+                handle,
             },
         ))
     }
@@ -196,13 +290,42 @@ impl TonboTable {
                 desc.is_nullable,
             ));
         }
-        let record = DynRecord::new(values, self.primary_key_index);
+        let record = DynRecord::new(values.clone(), self.primary_key_index);
+        let record2 = DynRecord::new(values.clone(), self.primary_key_index);
+        let record3 = DynRecord::new(values.clone(), self.primary_key_index);
+        let record4 = DynRecord::new(values, self.primary_key_index);
 
         let (sender, receiver) = flume::bounded(1);
 
         self.req_tx.send(Task::Insert { sender, record }).unwrap();
         receiver.recv().unwrap();
+        let (sender, receiver) = flume::bounded(1);
 
+        self.req_tx
+            .send(Task::Insert {
+                sender,
+                record: record2,
+            })
+            .unwrap();
+        receiver.recv().unwrap();
+        let (sender, receiver) = flume::bounded(1);
+
+        self.req_tx
+            .send(Task::Insert {
+                sender,
+                record: record3,
+            })
+            .unwrap();
+        receiver.recv().unwrap();
+        let (sender, receiver) = flume::bounded(1);
+
+        self.req_tx
+            .send(Task::Insert {
+                sender,
+                record: record4,
+            })
+            .unwrap();
+        receiver.recv().unwrap();
         Ok(id.unwrap().as_i64()?)
     }
 }
@@ -233,6 +356,13 @@ unsafe impl<'vtab> VTab<'vtab> for TonboTable {
             buf: None,
             _p: Default::default(),
         })
+    }
+
+    fn integrity(&'vtab mut self, _flag: usize) -> rusqlite::Result<()> {
+        let (sender, receiver) = flume::bounded(1);
+
+        self.req_tx.send(Task::Flush { sender }).unwrap();
+        receiver.recv().unwrap()
     }
 }
 
