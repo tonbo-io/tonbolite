@@ -10,22 +10,22 @@ use wasm_bindgen_futures::js_sys;
 #[wasm_bindgen]
 pub struct Connection {
     conn: Arc<Mutex<rusqlite::Connection>>,
-    req_tx: Option<Sender<String>>,
-    resp_rx: Option<Receiver<usize>>,
+    req_tx: Option<Sender<Request>>,
+    resp_rx: Option<Receiver<Response>>,
 }
 
-impl Connection {
-    async fn execute_inner(&self, sql: String) -> Result<usize, JsValue> {
-        let conn = self.conn.clone();
-        let count = wasm_thread::Builder::new()
-            .spawn(|| async move { conn.lock().unwrap().execute(&sql, []).unwrap() })
-            .unwrap()
-            .join_async()
-            .await
-            .unwrap();
+enum Request {
+    Insert(String),
+    Delete(String),
+    Update(String),
+    Select(String),
+    Flush(String),
+}
 
-        Ok(count)
-    }
+enum Response {
+    RowCount(usize),
+    Rows(Vec<JsRow>),
+    Empty,
 }
 
 #[wasm_bindgen]
@@ -51,9 +51,46 @@ impl Connection {
         let conn = self.conn.clone();
         wasm_thread::Builder::new()
             .spawn(move || async move {
-                while let Ok(sql) = req_rx.recv() {
-                    let res = conn.lock().unwrap().execute(&sql, []).unwrap();
-                    resp_tx.send(res).unwrap();
+                while let Ok(req) = req_rx.recv_async().await {
+                    match req {
+                        Request::Insert(sql) | Request::Delete(sql) | Request::Update(sql) => {
+                            // let res = conn.lock().unwrap().execute(&sql, []).unwrap();
+                            // resp_tx.send(Response::RowCount(res)).unwrap();
+                            resp_tx.send_async(Response::RowCount(1)).await.unwrap();
+                        }
+                        Request::Select(sql) => {
+                            let db = conn.lock().unwrap();
+                            let mut result = vec![];
+                            let mut stmt = db.prepare(&sql).unwrap();
+                            let mut rows = stmt.query([]).unwrap();
+                            while let Some(row) = rows.next().unwrap() {
+                                let stmt = row.as_ref();
+                                let mut cols = vec![];
+
+                                for i in 0..stmt.column_count() {
+                                    let name = stmt.column_name(i).expect("valid column index");
+                                    let mut value: JsColumn = row.get(i).unwrap();
+                                    value.set_name(name.to_string());
+
+                                    cols.push(value);
+                                }
+                                result.push(JsRow::new(cols))
+                            }
+                            resp_tx.send_async(Response::Rows(result)).await.unwrap();
+                        }
+                        Request::Flush(table) => {
+                            conn.lock()
+                                .unwrap()
+                                .pragma(
+                                    None,
+                                    "quick_check",
+                                    table.as_str(),
+                                    |_r| -> rusqlite::Result<()> { Ok(()) },
+                                )
+                                .unwrap();
+                            resp_tx.send(Response::Empty).unwrap();
+                        }
+                    }
                 }
             })
             .unwrap();
@@ -62,43 +99,32 @@ impl Connection {
 
     /// Convenience method to execute a single `INSERT` SQL statement.
     pub async fn insert(&self, sql: String) -> Result<usize, JsValue> {
-        self.req_tx.as_ref().unwrap().send_async(sql).await.unwrap();
-        let count = self.resp_rx.as_ref().unwrap().recv_async().await.unwrap();
+        self.req_tx
+            .as_ref()
+            .unwrap()
+            .send_async(Request::Insert(sql))
+            .await
+            .unwrap();
+        let Response::RowCount(count) = self.resp_rx.as_ref().unwrap().recv_async().await.unwrap()
+        else {
+            unreachable!()
+        };
 
         Ok(count)
-        // self.execute_inner(sql).await
     }
 
     /// Convenience method to prepare and execute a single select SQL statement.
     pub async fn select(&self, sql: String) -> Vec<JsValue> {
-        let conn = self.conn.clone();
-        let rows = wasm_thread::Builder::new()
-            .spawn(move || async move {
-                let db = conn.lock().unwrap();
-                let mut result = vec![];
-                let mut stmt = db.prepare(&sql).unwrap();
-                let mut rows = stmt.query([]).unwrap();
-                while let Some(row) = rows.next().unwrap() {
-                    let stmt = row.as_ref();
-                    let mut cols = vec![];
-
-                    for i in 0..stmt.column_count() {
-                        let name = stmt.column_name(i).expect("valid column index");
-                        let mut value: JsColumn = row.get(i).unwrap();
-                        value.set_name(name.to_string());
-
-                        cols.push(value);
-                    }
-                    result.push(JsRow::new(cols))
-                }
-
-                result
-            })
+        self.req_tx
+            .as_ref()
             .unwrap()
-            .join_async()
+            .send_async(Request::Select(sql))
             .await
             .unwrap();
-
+        let Response::Rows(rows) = self.resp_rx.as_ref().unwrap().recv_async().await.unwrap()
+        else {
+            unreachable!()
+        };
         let mut result = vec![];
         for row in rows {
             result.push(row.into());
@@ -108,33 +134,45 @@ impl Connection {
 
     /// Convenience method to execute a single `DELETE` SQL statement.
     pub async fn delete(&self, sql: String) -> Result<usize, JsValue> {
-        self.execute_inner(sql).await
+        self.req_tx
+            .as_ref()
+            .unwrap()
+            .send_async(Request::Update(sql))
+            .await
+            .unwrap();
+        let Response::RowCount(count) = self.resp_rx.as_ref().unwrap().recv_async().await.unwrap()
+        else {
+            unreachable!()
+        };
+
+        Ok(count)
     }
 
     /// Convenience method to execute a single `UPDATE` SQL statement.
     pub async fn update(&self, sql: String) -> Result<usize, JsValue> {
-        self.execute_inner(sql).await
+        self.req_tx
+            .as_ref()
+            .unwrap()
+            .send_async(Request::Delete(sql))
+            .await
+            .unwrap();
+        let Response::RowCount(count) = self.resp_rx.as_ref().unwrap().recv_async().await.unwrap()
+        else {
+            unreachable!()
+        };
+
+        Ok(count)
     }
 
     /// Flush data to stable storage.
     pub async fn flush(&self, table: String) {
-        let conn = self.conn.clone();
-        wasm_thread::Builder::new()
-            .spawn(|| async move {
-                conn.lock()
-                    .unwrap()
-                    .pragma(
-                        None,
-                        "quick_check",
-                        table.as_str(),
-                        |_r| -> rusqlite::Result<()> { Ok(()) },
-                    )
-                    .unwrap()
-            })
+        self.req_tx
+            .as_ref()
             .unwrap()
-            .join_async()
+            .send_async(Request::Flush(table))
             .await
             .unwrap();
+        let _ = self.resp_rx.as_ref().unwrap().recv_async().await.unwrap();
     }
 }
 
@@ -219,11 +257,9 @@ impl From<JsRow> for JsValue {
 #[cfg(test)]
 mod tests {
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
-
     use crate::Connection;
     use rusqlite::fallible_iterator::FallibleIterator;
     use wasm_bindgen_test::wasm_bindgen_test;
-
     #[wasm_bindgen_test]
     async fn test_write() {
         let mut conn = Connection::open();
@@ -232,57 +268,16 @@ mod tests {
                     create_sql='create table tonbo(id bigint primary key, name varchar, like int)',
                     path='db_path/test'
             );"
-            .to_string(),
+                .to_string(),
         )
-        .await
-        .unwrap();
-
+            .await
+            .unwrap();
         for i in 0..1000 {
-            // if i % 5 == 0 {
-            //     conn.flush("tonbo".to_string()).await;
-            // }
             conn.insert(format!(
                 "INSERT INTO tonbo (id, name, like) VALUES ({i}, '{i}', {i})"
             ))
-            .await
-            .unwrap();
+                .await
+                .unwrap();
         }
     }
-
-    // #[ignore]
-    // #[wasm_bindgen_test]
-    // async fn test_write_s3() {
-    //     if option_env!("AWS_ACCESS_KEY_ID").is_none() {
-    //         return;
-    //     }
-    //     let key_id = option_env!("AWS_ACCESS_KEY_ID").unwrap().to_string();
-    //     let secret_key = option_env!("AWS_SECRET_ACCESS_KEY").unwrap().to_string();
-    //
-    //     let mut conn = Connection::open();
-    //     conn.create(format!(
-    //         "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
-    //                 create_sql='create table tonbo(id bigint primary key, name varchar, like int)',
-    //                 path = 'sqlite-tonbo',
-    //                 bucket = 'wasm-data',
-    //                 key_id = {key_id},
-    //                 secret_key = {secret_key},
-    //                 region = 'ap-southeast-2',
-    //                 fs=s3,
-    //                 s3_url='sqlite-tonbo'
-    //         );"
-    //     ))
-    //     .await
-    //     .unwrap();
-    //
-    //     for i in 0..100 {
-    //         if i % 5 == 0 {
-    //             conn.flush("tonbo".to_string()).await;
-    //         }
-    //         conn.insert(format!(
-    //             "INSERT INTO tonbo (id, name, like) VALUES ({i}, '{i}', {i})"
-    //         ))
-    //         .await
-    //         .unwrap();
-    //     }
-    // }
 }
