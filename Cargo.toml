@@ -37,7 +37,6 @@ rusqlite = { git = "https://github.com/tonbo-io/rusqlite", branch = "wasm32-unkn
     "vtab",
     "bundled",
 ] }
-sqlparser = "0.52"
 
 wasm-bindgen = { version = "0.2.93", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
