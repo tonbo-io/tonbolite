@@ -1,25 +1,20 @@
 use crate::executor::{BlockOnExecutor, SQLiteExecutor};
-use crate::utils::{parse_type, set_result, type_trans, value_trans};
+use crate::utils::{set_result, value_trans};
 use flume::{Receiver, Sender};
-use fusio::path::Path;
-use fusio_dispatch::FsOptions;
 use futures_util::StreamExt;
 use rusqlite::types::ValueRef;
 use rusqlite::vtab::{
-    parse_boolean, update_module, Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection,
-    VTabCursor, VTabKind, ValueIter, Values,
+    Context, CreateVTab, IndexInfo, UpdateVTab, VTab, VTabConnection, VTabCursor, VTabKind,
+    ValueIter, Values,
 };
-use rusqlite::{ffi, vtab, Connection, Error};
-use sqlparser::ast::{ColumnOption, DataType, Statement};
+use rusqlite::{ffi, vtab, Error};
 use sqlparser::dialect::MySqlDialect;
-use sqlparser::parser::Parser;
 use std::collections::Bound;
 use std::ffi::c_int;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tonbo::executor::Executor;
 use tonbo::record::{Column, DynRecord, Record};
-use tonbo::{DbOption, DB};
 use tonbo_net_client::client::{TonboClient, TonboSchema};
 use tonbo_net_client::proto::{tonbo_rpc_client, ColumnDesc, Datatype};
 
@@ -38,7 +33,7 @@ impl DbState {
 #[repr(C)]
 pub struct TonboTable {
     base: ffi::sqlite3_vtab,
-    schema: TonboSchema,
+    schema: Option<TonboSchema>,
     req_tx: Sender<Request>,
 }
 
@@ -54,10 +49,49 @@ enum Request {
         tuple_tx: Sender<Option<DynRecord>>,
     },
     Insert(DynRecord),
-    Remove(Column)
+    Remove(Column),
+    Schema(Sender<Result<TonboSchema, Error>>),
+    Flush(Sender<rusqlite::Result<()>>),
 }
 
 impl TonboTable {
+    async fn handle_request(mut client: TonboClient, req_rx: Receiver<Request>) {
+        while let Ok(req) = req_rx.recv() {
+            match req {
+                Request::Scan {
+                    lower,
+                    upper,
+                    tuple_tx,
+                } => {
+                    let mut stream = client.scan(lower, upper).await.unwrap();
+
+                    while let Some(result) = stream.next().await {
+                        let entry = result.unwrap();
+                        let _ = tuple_tx.send(Some(entry));
+                    }
+                    let _ = tuple_tx.send(None);
+                }
+                Request::Insert(record) => client.insert(record).await.unwrap(),
+                Request::Remove(key) => client.remove(key).await.unwrap(),
+                Request::Schema(schema_tx) => {
+                    let schema = client
+                        .schema()
+                        .await
+                        .map_err(|err| Error::ModuleError(err.to_string()));
+                    schema_tx.send(schema).unwrap();
+                }
+                Request::Flush(sender) => {
+                    let result = client
+                        .flush()
+                        .await
+                        .map_err(|err| Error::ModuleError(err.to_string()));
+
+                    sender.send(result).unwrap();
+                }
+            }
+        }
+    }
+
     fn connect_create(
         _: &mut VTabConnection,
         aux: Option<&Arc<DbState>>,
@@ -93,55 +127,72 @@ impl TonboTable {
                 }
             }
         }
-        let table_name = table_name.ok_or_else(|| Error::ModuleError("`table_name` not found".to_string()))?;
-        let (create_table_sql, mut client, schema) = aux.unwrap().executor.block_on(async {
-            let mut client = TonboClient::connect(addr.ok_or_else(|| Error::ModuleError("`addr` not found".to_string()))?)
-                .await
-                .map_err(|err| Error::ModuleError(err.to_string()))?;
-            let schema = client.schema().await.map_err(|err| Error::ModuleError(err.to_string()))?;
-            let create_table_sql = desc_to_create_table(&schema.desc, &table_name);
-            Ok::<(String, TonboClient, TonboSchema), rusqlite::Error>((create_table_sql, client, schema))
-        })?;
-        let (req_tx, req_rx): (_, Receiver<Request>) = flume::bounded(1);
-        aux.unwrap().executor.spawn(async move {
-            while let Ok(req) = req_rx.recv() {
-                match req {
-                    Request::Scan { lower, upper, tuple_tx } => {
-                        let mut stream = client
-                            .scan(lower, upper)
-                            .await
-                            .unwrap();
+        let table_name =
+            table_name.ok_or_else(|| Error::ModuleError("`table_name` not found".to_string()))?;
 
-                        while let Some(result) = stream.next().await {
-                            let entry = result.unwrap();
-                            let _ = tuple_tx.send(Some(entry));
-                        }
-                        let _ = tuple_tx.send(None);
-                    }
-                    Request::Insert(record) => {
-                        client.insert(record).await.unwrap()
-                    }
-                    Request::Remove(key) => {
-                        client.remove(key).await.unwrap()
-                    }
-                }
-            }
+        let (req_tx, req_rx): (_, Receiver<Request>) = flume::bounded(1);
+
+        #[cfg(feature = "wasm")]
+        wasm_thread::Builder::new()
+            .spawn(move || async move {
+                let client = TonboClient::connect(
+                    addr.ok_or_else(|| Error::ModuleError("`addr` not found".to_string()))
+                        .unwrap(),
+                )
+                .await
+                .map_err(|err| Error::ModuleError(err.to_string()))
+                .unwrap();
+
+                Self::handle_request(client, req_rx).await;
+            })
+            .expect("initialize web worker failed.");
+        #[cfg(not(feature = "wasm"))]
+        aux.unwrap().executor.spawn(async move {
+            let client = TonboClient::connect(
+                addr.ok_or_else(|| Error::ModuleError("`addr` not found".to_string()))
+                    .unwrap(),
+            )
+            .await
+            .map_err(|err| Error::ModuleError(err.to_string()))
+            .unwrap();
+
+            Self::handle_request(client, req_rx).await;
         });
+
+        let create_table_sql =
+            "CREATE TABLE IF NOT EXISTS tonbo(id bigint primary key, name varchar, like int)"
+                .to_string();
 
         Ok((
             create_table_sql,
             Self {
                 base: ffi::sqlite3_vtab::default(),
                 req_tx,
-                schema,
+                schema: None,
             },
         ))
     }
 
+    fn schema(&mut self) -> Result<&TonboSchema, Error> {
+        if self.schema.is_none() {
+            let (schema_tx, schema_rx): (_, Receiver<Result<TonboSchema, Error>>) =
+                flume::bounded(1);
+
+            self.req_tx.send(Request::Schema(schema_tx)).unwrap();
+            let schema = schema_rx.recv().unwrap()?;
+
+            self.schema = Some(schema);
+        }
+
+        Ok(self.schema.as_ref().unwrap())
+    }
+
     fn _remove(&mut self, pk: i64) -> Result<(), Error> {
-        let desc: &ColumnDesc = &self.schema.primary_key_desc();
+        let desc: &ColumnDesc = &self.schema()?.primary_key_desc();
         let value = Column::new(
-            tonbo::record::Datatype::from(Datatype::try_from(desc.ty).map_err(|err| Error::ModuleError(err.to_string()))?),
+            tonbo::record::Datatype::from(
+                Datatype::try_from(desc.ty).map_err(|err| Error::ModuleError(err.to_string()))?,
+            ),
             desc.name.clone(),
             Arc::new(pk),
             desc.is_nullable,
@@ -153,13 +204,17 @@ impl TonboTable {
 
     fn _insert(&mut self, args: ValueIter) -> Result<i64, Error> {
         let mut id = None;
-        let mut values = Vec::with_capacity(self.schema.len());
+        let schema = self.schema()?;
+        let mut values = Vec::with_capacity(schema.len());
 
-        for (i, (desc, value)) in self.schema.desc.iter().zip(args).enumerate() {
-            if i == self.schema.primary_key_index {
+        let primary_key_index = schema.primary_key_index;
+        for (i, (desc, value)) in schema.desc.iter().zip(args).enumerate() {
+            if i == primary_key_index {
                 id = Some(value);
             }
-            let datatype = tonbo::record::Datatype::from(Datatype::try_from(desc.ty).map_err(|err| Error::ModuleError(err.to_string()))?);
+            let datatype = tonbo::record::Datatype::from(
+                Datatype::try_from(desc.ty).map_err(|err| Error::ModuleError(err.to_string()))?,
+            );
             values.push(Column::new(
                 datatype,
                 desc.name.clone(),
@@ -168,7 +223,9 @@ impl TonboTable {
             ));
         }
 
-        self.req_tx.send(Request::Insert(DynRecord::new(values, self.schema.primary_key_index))).unwrap();
+        self.req_tx
+            .send(Request::Insert(DynRecord::new(values, primary_key_index)))
+            .unwrap();
         Ok(id.unwrap().as_i64()?)
     }
 }
@@ -199,6 +256,13 @@ unsafe impl<'vtab> VTab<'vtab> for TonboTable {
             buf: None,
             _p: Default::default(),
         })
+    }
+
+    fn integrity(&'vtab mut self, _flag: usize) -> rusqlite::Result<()> {
+        let (flush_tx, flush_rx) = flume::bounded(1);
+
+        self.req_tx.send(Request::Flush(flush_tx)).unwrap();
+        flush_rx.recv().unwrap()
     }
 }
 
@@ -273,7 +337,7 @@ unsafe impl VTabCursor for RecordCursor<'_> {
             .send(Request::Scan {
                 lower: Bound::Unbounded,
                 upper: Bound::Unbounded,
-                tuple_tx
+                tuple_tx,
             })
             .unwrap();
         self.tuple_rx = Some(tuple_rx);
@@ -283,7 +347,12 @@ unsafe impl VTabCursor for RecordCursor<'_> {
     }
 
     fn next(&mut self) -> rusqlite::Result<()> {
-        self.buf = self.tuple_rx.as_mut().expect("`filter` was not called").recv().unwrap();
+        self.buf = self
+            .tuple_rx
+            .as_mut()
+            .expect("`filter` was not called")
+            .recv()
+            .unwrap();
 
         Ok(())
     }
@@ -325,12 +394,22 @@ fn data_type_to_sql_type(data_type: &Datatype) -> &str {
 fn desc_to_create_table(desc: &[ColumnDesc], table_name: &str) -> String {
     let columns: Vec<String> = desc
         .iter()
-        .map(|field| format!("{} {} {}", field.name, data_type_to_sql_type(&Datatype::try_from(field.ty).unwrap()), if field.is_nullable { "nullable" } else { "" }))
+        .map(|field| {
+            format!(
+                "{} {} {}",
+                field.name,
+                data_type_to_sql_type(&Datatype::try_from(field.ty).unwrap()),
+                if field.is_nullable { "nullable" } else { "" }
+            )
+        })
         .collect();
 
-    format!("CREATE TABLE {} (\n    {}\n);", table_name, columns.join(",\n    "))
+    format!(
+        "CREATE TABLE {} (\n    {}\n);",
+        table_name,
+        columns.join(",\n    ")
+    )
 }
-
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -388,6 +467,9 @@ pub(crate) mod tests {
         let mut rows = stmt.query(["2"])?;
         assert!(rows.next()?.is_none());
 
+        db.pragma(None, "quick_check", "tonbo", |_r| -> rusqlite::Result<()> {
+            Ok(())
+        })?;
         Ok(())
     }
 }

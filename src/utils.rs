@@ -6,32 +6,6 @@ use std::any::Any;
 use std::sync::Arc;
 use tonbo::record::{Column, Datatype};
 
-pub(crate) fn parse_type(input: &str) -> rusqlite::Result<(Datatype, bool, bool)> {
-    let input = input.trim();
-
-    let is_nullable = input.contains("nullable");
-    let is_primary_key = input.contains("primary key");
-
-    let mut type_str = input.to_string();
-    if is_nullable {
-        type_str = type_str.replace("nullable", "");
-    }
-    if is_primary_key {
-        type_str = type_str.replace("primary key", "");
-    }
-    let ty = match type_str.trim() {
-        "int" => Datatype::Int64,
-        "varchar" => Datatype::String,
-        _ => {
-            return Err(Error::ModuleError(format!(
-                "unrecognized parameter '{input}'"
-            )));
-        }
-    };
-
-    Ok((ty, is_nullable, is_primary_key))
-}
-
 macro_rules! nullable_value {
     ($value:expr, $is_nullable:expr) => {
         if $is_nullable {
@@ -212,23 +186,4 @@ pub(crate) fn set_result(ctx: &mut Context, col: &Column) -> rusqlite::Result<()
         }
     }
     Ok(())
-}
-
-pub(crate) fn type_trans(ty: &DataType) -> Datatype {
-    match ty {
-        DataType::Int8(_) => Datatype::Int8,
-        DataType::Int16 | DataType::SmallInt(_) => Datatype::Int16,
-        DataType::Int(_) | DataType::Int32 | DataType::Integer(_) => Datatype::Int32,
-        DataType::Int64 | DataType::BigInt(_) => Datatype::Int64,
-        DataType::UnsignedInt(_) | DataType::UInt32 | DataType::UnsignedInteger(_) => {
-            Datatype::UInt32
-        }
-        DataType::UInt8 | DataType::UnsignedInt8(_) => Datatype::UInt8,
-        DataType::UInt16 => Datatype::UInt16,
-        DataType::UInt64 | DataType::UnsignedBigInt(_) => Datatype::UInt64,
-        DataType::Bool | DataType::Boolean => Datatype::Boolean,
-        DataType::Bytes(_) => Datatype::Bytes,
-        DataType::Varchar(_) => Datatype::String,
-        _ => todo!(),
-    }
 }
