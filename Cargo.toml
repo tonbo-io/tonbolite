@@ -9,12 +9,13 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["tokio"]
-tokio = ["dep:tokio", "tonbo/tokio"]
+tokio = ["dep:tokio",  "tonbo_net_client/default"]
 wasm = [
     "dep:wasm_thread",
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
-    "tonbo/wasm",
+    "fusio/no-send",
+    "tonbo_net_client/wasm"
 ]
 
 [dependencies]
@@ -26,11 +27,9 @@ fusio = { git = "https://github.com/tonbo-io/fusio.git", rev = "88c6134948d05bef
 ] }
 futures-util = "0.3"
 tokio = { version = "1.41", optional = true, features = ["rt-multi-thread"] }
-tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "a6ee2303464667d3689ae1c1b075bb25840063d7", package = "tonbo", default-features = false, features = [
-    "bytes",
-], optional = true }
-tonbo_net_client = { git = "https://github.com/tonbo-io/tonbo", rev = "a6ee2303464667d3689ae1c1b075bb25840063d7", package = "tonbo_net_client" }
-rusqlite = { git = "https://github.com/tonbo-io/rusqlite", branch = "wasm32-unknown-unknown", features = [
+tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "a6ee2303464667d3689ae1c1b075bb25840063d7", package = "tonbo", default-features = false }
+tonbo_net_client = { git = "https://github.com/tonbo-io/tonbo", rev = "a6ee2303464667d3689ae1c1b075bb25840063d7", default-features = false, package = "tonbo_net_client" }
+rusqlite = { git = "https://github.com/tonbo-io/rusqlite", branch = "feat/integrity", features = [
     "vtab",
     "bundled",
 ] }
@@ -42,7 +41,7 @@ wasm_thread = { version = "0.3", optional = true }
 
 log = "0.4"
 console_log = { version = "1.0", features = ["color"] }
-
+console_error_panic_hook = "0.1.7"
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 

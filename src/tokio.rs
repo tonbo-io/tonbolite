@@ -1,4 +1,4 @@
-use crate::executor::{BlockOnExecutor, SQLiteExecutor};
+use crate::executor::SQLiteExecutor;
 use crate::utils::type_trans;
 use crate::utils::{set_result, value_trans};
 use flume::{Receiver, Sender};
@@ -49,9 +49,40 @@ enum Request {
     },
     Insert(DynRecord),
     Remove(Column),
+    Flush(Sender<rusqlite::Result<()>>),
 }
 
 impl TonboTable {
+    async fn handle_request(mut client: TonboClient, req_rx: Receiver<Request>) {
+        while let Ok(req) = req_rx.recv() {
+            match req {
+                Request::Scan {
+                    lower,
+                    upper,
+                    tuple_tx,
+                } => {
+                    let mut stream = client.scan(lower, upper).await.unwrap();
+
+                    while let Some(result) = stream.next().await {
+                        let entry = result.unwrap();
+                        let _ = tuple_tx.send(Some(entry));
+                    }
+                    let _ = tuple_tx.send(None);
+                }
+                Request::Insert(record) => client.insert(record).await.unwrap(),
+                Request::Remove(key) => client.remove(key).await.unwrap(),
+                Request::Flush(sender) => {
+                    let result = client
+                        .flush()
+                        .await
+                        .map_err(|err| Error::ModuleError(err.to_string()));
+
+                    sender.send(result).unwrap();
+                }
+            }
+        }
+    }
+
     fn connect_create(
         _: &mut VTabConnection,
         aux: Option<&Arc<DbState>>,
@@ -78,6 +109,13 @@ impl TonboTable {
                         &Parser::parse_sql(&dialect, value)
                             .map_err(|err| Error::ModuleError(err.to_string()))?[0]
                     {
+                        if table_name.is_some() {
+                            return Err(Error::ModuleError("`table_name` duplicate".to_string()));
+                        }
+                        table_name = match create_table.name.0.as_slice() {
+                            [table] => Some(table.value.to_owned()),
+                            _ => return Err(Error::ModuleError("invalid table name".to_string())),
+                        };
                         for (i, column_def) in create_table.columns.iter().enumerate() {
                             let name = column_def.name.value.to_ascii_lowercase();
                             let datatype = type_trans(&column_def.data_type);
@@ -122,12 +160,6 @@ impl TonboTable {
                     }
                     addr = Some(value.to_string());
                 }
-                "table_name" => {
-                    if table_name.is_some() {
-                        return Err(Error::ModuleError("`table_name` duplicate".to_string()));
-                    }
-                    table_name = Some(value.to_string());
-                }
                 _ => {
                     return Err(Error::ModuleError(format!(
                         "unrecognized parameter '{param}'"
@@ -140,39 +172,45 @@ impl TonboTable {
         })?;
         let table_name =
             table_name.ok_or_else(|| Error::ModuleError("`table_name` not found".to_string()))?;
-        let mut client = aux.unwrap().executor.block_on(async {
+        let (req_tx, req_rx): (_, Receiver<Request>) = flume::bounded(1);
+        let schema_desc = descs.clone();
+
+        #[cfg(feature = "wasm")]
+        wasm_thread::Builder::new()
+            .spawn(move || async move {
+                let client = match TonboClient::connect(
+                    addr.ok_or_else(|| Error::ModuleError("`addr` not found".to_string()))
+                        .unwrap(),
+                    table_name,
+                    schema_desc,
+                    pk_index,
+                )
+                .await
+                {
+                    Ok(client) => client,
+                    Err(err) => {
+                        log::error!("{}", err.to_string());
+                        panic!("error occurs while connecting: {}", err);
+                    }
+                };
+
+                Self::handle_request(client, req_rx).await;
+            })
+            .expect("initialize web worker failed.");
+        #[cfg(not(feature = "wasm"))]
+        aux.unwrap().executor.spawn(async move {
             let client = TonboClient::connect(
-                addr.ok_or_else(|| Error::ModuleError("`addr` not found".to_string()))?,
+                addr.ok_or_else(|| Error::ModuleError("`addr` not found".to_string()))
+                    .unwrap(),
                 table_name,
-                descs.clone(),
+                schema_desc,
                 pk_index,
             )
             .await
-            .map_err(|err| Error::ModuleError(err.to_string()))?;
+            .map_err(|err| Error::ModuleError(err.to_string()))
+            .unwrap();
 
-            Ok::<TonboClient, rusqlite::Error>(client)
-        })?;
-        let (req_tx, req_rx): (_, Receiver<Request>) = flume::bounded(1);
-        aux.unwrap().executor.spawn(async move {
-            while let Ok(req) = req_rx.recv() {
-                match req {
-                    Request::Scan {
-                        lower,
-                        upper,
-                        tuple_tx,
-                    } => {
-                        let mut stream = client.scan(lower, upper).await.unwrap();
-
-                        while let Some(result) = stream.next().await {
-                            let entry = result.unwrap();
-                            let _ = tuple_tx.send(Some(entry));
-                        }
-                        let _ = tuple_tx.send(None);
-                    }
-                    Request::Insert(record) => client.insert(record).await.unwrap(),
-                    Request::Remove(key) => client.remove(key).await.unwrap(),
-                }
-            }
+            Self::handle_request(client, req_rx).await;
         });
 
         Ok((
@@ -248,6 +286,13 @@ unsafe impl<'vtab> VTab<'vtab> for TonboTable {
             buf: None,
             _p: Default::default(),
         })
+    }
+
+    fn integrity(&'vtab mut self, _flag: usize) -> rusqlite::Result<()> {
+        let (flush_tx, flush_rx) = flume::bounded(1);
+
+        self.req_tx.send(Request::Flush(flush_tx)).unwrap();
+        flush_rx.recv().unwrap()
     }
 }
 
@@ -372,7 +417,6 @@ pub(crate) mod tests {
         db.execute_batch(
             "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
                     create_sql = 'create table tonbo(id bigint primary key, name varchar, like int)',
-                    table_name ='tonbo',
                     addr = 'http://[::1]:50051',
             );",
         )?;
@@ -416,6 +460,9 @@ pub(crate) mod tests {
         let mut rows = stmt.query(["2"])?;
         assert!(rows.next()?.is_none());
 
+        db.pragma(None, "quick_check", "tonbo", |_r| -> rusqlite::Result<()> {
+            Ok(())
+        })?;
         Ok(())
     }
 }
