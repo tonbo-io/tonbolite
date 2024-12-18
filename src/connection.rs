@@ -10,8 +10,8 @@ use wasm_bindgen_futures::js_sys;
 #[wasm_bindgen]
 pub struct Connection {
     conn: Arc<Mutex<rusqlite::Connection>>,
-    req_tx: Option<Sender<Request>>,
-    resp_rx: Option<Receiver<Response>>,
+    req_tx: Sender<Request>,
+    resp_rx: Receiver<Response>,
 }
 
 enum Request {
@@ -28,27 +28,12 @@ enum Response {
     Empty,
 }
 
-#[wasm_bindgen]
 impl Connection {
-    pub fn open() -> Self {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        load_module(&conn).unwrap();
-        Self {
-            conn: Arc::new(Mutex::new(conn)),
-            req_tx: None,
-            resp_rx: None,
-        }
-    }
-
-    /// Convenience method to execute a single `CREATE` SQL statement.
-    pub async fn create(&mut self, sql: String) -> Result<usize, JsValue> {
-        let res = { self.conn.lock().unwrap().execute(&sql, []).unwrap() };
-
-        let (req_tx, req_rx) = flume::bounded(1);
-        let (resp_tx, resp_rx) = flume::bounded(1);
-        self.req_tx = Some(req_tx);
-        self.resp_rx = Some(resp_rx);
-        let conn = self.conn.clone();
+    fn handle_request(
+        conn: Arc<Mutex<rusqlite::Connection>>,
+        req_rx: Receiver<Request>,
+        resp_tx: Sender<Response>,
+    ) {
         wasm_thread::Builder::new()
             .spawn(move || async move {
                 while let Ok(req) = req_rx.recv_async().await {
@@ -78,6 +63,7 @@ impl Connection {
                             resp_tx.send_async(Response::Rows(result)).await.unwrap();
                         }
                         Request::Flush(table) => {
+                            // We use PRAGMA quick_check to flush
                             conn.lock()
                                 .unwrap()
                                 .pragma(
@@ -92,20 +78,41 @@ impl Connection {
                     }
                 }
             })
-            .unwrap();
+            .expect("initialize web worker failed.");
+    }
+}
+
+#[wasm_bindgen]
+impl Connection {
+    #[wasm_bindgen(constructor)]
+    pub fn open() -> Self {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        load_module(&conn).unwrap();
+        
+        let conn = Arc::new(Mutex::new(conn));
+        let (req_tx, req_rx) = flume::bounded(1);
+        let (resp_tx, resp_rx) = flume::bounded(1);
+
+        Self::handle_request(conn.clone(), req_rx, resp_tx);
+
+        Self {
+            conn,
+            req_tx,
+            resp_rx,
+        }
+    }
+
+    /// Convenience method to execute a single `CREATE` SQL statement.
+    pub async fn create(&mut self, sql: String) -> Result<usize, JsValue> {
+        let res = { self.conn.lock().unwrap().execute(&sql, []).unwrap() };
+
         Ok(res)
     }
 
     /// Convenience method to execute a single `INSERT` SQL statement.
     pub async fn insert(&self, sql: String) -> Result<usize, JsValue> {
-        self.req_tx
-            .as_ref()
-            .unwrap()
-            .send_async(Request::Insert(sql))
-            .await
-            .unwrap();
-        let Response::RowCount(count) = self.resp_rx.as_ref().unwrap().recv_async().await.unwrap()
-        else {
+        self.req_tx.send_async(Request::Insert(sql)).await.unwrap();
+        let Response::RowCount(count) = self.resp_rx.recv_async().await.unwrap() else {
             unreachable!()
         };
 
@@ -114,14 +121,8 @@ impl Connection {
 
     /// Convenience method to prepare and execute a single select SQL statement.
     pub async fn select(&self, sql: String) -> Vec<JsValue> {
-        self.req_tx
-            .as_ref()
-            .unwrap()
-            .send_async(Request::Select(sql))
-            .await
-            .unwrap();
-        let Response::Rows(rows) = self.resp_rx.as_ref().unwrap().recv_async().await.unwrap()
-        else {
+        self.req_tx.send_async(Request::Select(sql)).await.unwrap();
+        let Response::Rows(rows) = self.resp_rx.recv_async().await.unwrap() else {
             unreachable!()
         };
         let mut result = vec![];
@@ -133,14 +134,8 @@ impl Connection {
 
     /// Convenience method to execute a single `DELETE` SQL statement.
     pub async fn delete(&self, sql: String) -> Result<usize, JsValue> {
-        self.req_tx
-            .as_ref()
-            .unwrap()
-            .send_async(Request::Update(sql))
-            .await
-            .unwrap();
-        let Response::RowCount(count) = self.resp_rx.as_ref().unwrap().recv_async().await.unwrap()
-        else {
+        self.req_tx.send_async(Request::Delete(sql)).await.unwrap();
+        let Response::RowCount(count) = self.resp_rx.recv_async().await.unwrap() else {
             unreachable!()
         };
 
@@ -149,14 +144,8 @@ impl Connection {
 
     /// Convenience method to execute a single `UPDATE` SQL statement.
     pub async fn update(&self, sql: String) -> Result<usize, JsValue> {
-        self.req_tx
-            .as_ref()
-            .unwrap()
-            .send_async(Request::Delete(sql))
-            .await
-            .unwrap();
-        let Response::RowCount(count) = self.resp_rx.as_ref().unwrap().recv_async().await.unwrap()
-        else {
+        self.req_tx.send_async(Request::Update(sql)).await.unwrap();
+        let Response::RowCount(count) = self.resp_rx.recv_async().await.unwrap() else {
             unreachable!()
         };
 
@@ -165,13 +154,8 @@ impl Connection {
 
     /// Flush data to stable storage.
     pub async fn flush(&self, table: String) {
-        self.req_tx
-            .as_ref()
-            .unwrap()
-            .send_async(Request::Flush(table))
-            .await
-            .unwrap();
-        let _ = self.resp_rx.as_ref().unwrap().recv_async().await.unwrap();
+        self.req_tx.send_async(Request::Flush(table)).await.unwrap();
+        let _ = self.resp_rx.recv_async().await.unwrap();
     }
 }
 
@@ -208,6 +192,7 @@ enum Value {
     Integer(i64),
     Real(f64),
     Text(String),
+    Blob(Vec<u8>),
 }
 
 impl FromSql for JsColumn {
@@ -217,9 +202,7 @@ impl FromSql for JsColumn {
             ValueRef::Integer(i) => Value::Integer(i),
             ValueRef::Real(f) => Value::Real(f),
             ValueRef::Text(s) => Value::Text(String::from_utf8_lossy(s).to_string()),
-            ValueRef::Blob(_b) => {
-                todo!()
-            }
+            ValueRef::Blob(b) => Value::Blob(b.to_vec()),
         };
 
         Ok(JsColumn::new(value))
@@ -245,6 +228,11 @@ impl From<JsRow> for JsValue {
                 }
                 Value::Text(s) => {
                     js_sys::Reflect::set(&object, &col.name.unwrap().into(), &JsValue::from(s))
+                        .unwrap();
+                }
+                Value::Blob(vec) => {
+                    let js_arr = js_sys::Uint8Array::from(vec.as_slice());
+                    js_sys::Reflect::set(&object, &col.name.unwrap().into(), &js_arr.into())
                         .unwrap();
                 }
             }

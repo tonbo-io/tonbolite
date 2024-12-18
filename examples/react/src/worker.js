@@ -4,7 +4,7 @@ let conn;
   const tonbo = await import("./pkg/sqlite_tonbo.js");
   await tonbo.default();
 
-  conn = tonbo.Connection.open();
+  conn = new tonbo.Connection();
 
   await conn.create(`CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
       table_name ='tonbo',
@@ -16,6 +16,10 @@ let conn;
       `INSERT INTO tonbo (id, name, like) VALUES (${i}, 'lol', ${i})`
     );
   }
+
+  const rows = await conn.select("SELECT * FROM tonbo limit 10");
+  console.log(rows);
+
 })();
 
 onmessage = function (event) {
@@ -29,6 +33,16 @@ onmessage = function (event) {
       break;
     case "insert":
       conn.insert(sql).then((res) => {
+        this.postMessage({ type: type, data: res });
+      });
+      break;
+    case "delete":
+      conn.delete(sql).then((res) => {
+        this.postMessage({ type: type, data: res });
+      });
+      break;
+    case "update":
+      conn.update(sql).then((res) => {
         this.postMessage({ type: type, data: res });
       });
       break;

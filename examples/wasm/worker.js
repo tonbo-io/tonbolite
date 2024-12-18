@@ -1,12 +1,8 @@
-
-// tonbo = import("./pkg/sqlite_tonbo.js")
-
-
 async function initWorker() {
     const tonbo = await import("./pkg/sqlite_tonbo.js");
     await tonbo.default();
 
-    let conn = tonbo.Connection.open();
+    let conn = new tonbo.Connection();
 
     await conn.create(`CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
       table_name ='tonbo',
