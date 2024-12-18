@@ -21,6 +21,8 @@ use tonbo::executor::Executor;
 use tonbo::record::{Column, DynRecord};
 use tonbo_net_client::client::TonboClient;
 
+const ADDR: &str = "http://localhost:50051";
+
 pub struct DbState {
     executor: SQLiteExecutor,
 }
@@ -90,7 +92,6 @@ impl TonboTable {
         _: bool,
     ) -> rusqlite::Result<(String, Self)> {
         let dialect = MySqlDialect {};
-        let mut addr = None;
         let mut table_name = None;
         let mut create_sql = None;
         let mut primary_key_index = None;
@@ -154,12 +155,6 @@ impl TonboTable {
                         )));
                     }
                 }
-                "addr" => {
-                    if addr.is_some() {
-                        return Err(Error::ModuleError("`addr` duplicate".to_string()));
-                    }
-                    addr = Some(value.to_string());
-                }
                 _ => {
                     return Err(Error::ModuleError(format!(
                         "unrecognized parameter '{param}'"
@@ -174,13 +169,13 @@ impl TonboTable {
             table_name.ok_or_else(|| Error::ModuleError("`table_name` not found".to_string()))?;
         let (req_tx, req_rx): (_, Receiver<Request>) = flume::bounded(1);
         let schema_desc = descs.clone();
+        let addr = ADDR.to_string();
 
         #[cfg(feature = "wasm")]
         wasm_thread::Builder::new()
             .spawn(move || async move {
                 let client = match TonboClient::connect(
-                    addr.ok_or_else(|| Error::ModuleError("`addr` not found".to_string()))
-                        .unwrap(),
+                    addr,
                     table_name,
                     schema_desc,
                     pk_index,
@@ -200,8 +195,7 @@ impl TonboTable {
         #[cfg(not(feature = "wasm"))]
         aux.unwrap().executor.spawn(async move {
             let client = TonboClient::connect(
-                addr.ok_or_else(|| Error::ModuleError("`addr` not found".to_string()))
-                    .unwrap(),
+                addr,
                 table_name,
                 schema_desc,
                 pk_index,
