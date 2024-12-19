@@ -1,6 +1,7 @@
 use rusqlite::types::ValueRef;
 use rusqlite::vtab::Context;
 use rusqlite::Error;
+use sqlparser::ast::DataType;
 use std::any::Any;
 use std::sync::Arc;
 use tonbo::record::{Column, Datatype};
@@ -185,4 +186,23 @@ pub(crate) fn set_result(ctx: &mut Context, col: &Column) -> rusqlite::Result<()
         }
     }
     Ok(())
+}
+
+pub(crate) fn type_trans(ty: &DataType) -> Datatype {
+    match ty {
+        DataType::Int8(_) => Datatype::Int8,
+        DataType::Int16 | DataType::SmallInt(_) => Datatype::Int16,
+        DataType::Int(_) | DataType::Int32 | DataType::Integer(_) => Datatype::Int32,
+        DataType::Int64 | DataType::BigInt(_) => Datatype::Int64,
+        DataType::UnsignedInt(_) | DataType::UInt32 | DataType::UnsignedInteger(_) => {
+            Datatype::UInt32
+        }
+        DataType::UInt8 | DataType::UnsignedInt8(_) => Datatype::UInt8,
+        DataType::UInt16 => Datatype::UInt16,
+        DataType::UInt64 | DataType::UnsignedBigInt(_) => Datatype::UInt64,
+        DataType::Bool | DataType::Boolean => Datatype::Boolean,
+        DataType::Bytes(_) => Datatype::Bytes,
+        DataType::Varchar(_) => Datatype::String,
+        _ => todo!(),
+    }
 }
