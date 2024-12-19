@@ -1,4 +1,5 @@
 use crate::executor::{BlockOnExecutor, SQLiteExecutor};
+use crate::utils::type_trans;
 use crate::utils::{set_result, value_trans};
 use flume::{Receiver, Sender};
 use futures_util::StreamExt;
@@ -8,14 +9,17 @@ use rusqlite::vtab::{
     ValueIter, Values,
 };
 use rusqlite::{ffi, vtab, Error};
+use sqlparser::ast::ColumnOption;
+use sqlparser::ast::Statement;
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::parser::Parser;
 use std::collections::Bound;
 use std::ffi::c_int;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tonbo::executor::Executor;
 use tonbo::record::{Column, DynRecord};
-use tonbo_net_client::client::{TonboClient, TonboSchema};
-use tonbo_net_client::proto::{ColumnDesc, Datatype};
+use tonbo_net_client::client::TonboClient;
 
 pub struct DbState {
     executor: SQLiteExecutor,
@@ -32,7 +36,8 @@ impl DbState {
 #[repr(C)]
 pub struct TonboTable {
     base: ffi::sqlite3_vtab,
-    schema: TonboSchema,
+    descs: Vec<tonbo::record::ColumnDesc>,
+    pk_index: usize,
     req_tx: Sender<Request>,
 }
 
@@ -53,13 +58,64 @@ impl TonboTable {
         args: &[&[u8]],
         _: bool,
     ) -> rusqlite::Result<(String, Self)> {
+        let dialect = MySqlDialect {};
         let mut addr = None;
         let mut table_name = None;
+        let mut create_sql = None;
+        let mut primary_key_index = None;
+        let mut descs = Vec::new();
 
         let args = &args[3..];
         for c_slice in args.iter() {
             let (param, value) = vtab::parameter(c_slice)?;
             match param {
+                "create_sql" => {
+                    if create_sql.is_some() {
+                        return Err(Error::ModuleError("`create_sql` duplicate".to_string()));
+                    }
+                    create_sql = Some(value.to_string());
+                    if let Statement::CreateTable(create_table) =
+                        &Parser::parse_sql(&dialect, value)
+                            .map_err(|err| Error::ModuleError(err.to_string()))?[0]
+                    {
+                        for (i, column_def) in create_table.columns.iter().enumerate() {
+                            let name = column_def.name.value.to_ascii_lowercase();
+                            let datatype = type_trans(&column_def.data_type);
+                            let mut is_not_nullable = column_def
+                                .options
+                                .iter()
+                                .any(|option| matches!(option.option, ColumnOption::NotNull));
+                            let is_primary_key = column_def.options.iter().any(|option| {
+                                matches!(
+                                    option.option,
+                                    ColumnOption::Unique {
+                                        is_primary: true,
+                                        ..
+                                    }
+                                )
+                            });
+                            if is_primary_key {
+                                if primary_key_index.is_some() {
+                                    return Err(Error::ModuleError(
+                                        "the primary key must exist and only one is allowed"
+                                            .to_string(),
+                                    ));
+                                }
+                                is_not_nullable = true;
+                                primary_key_index = Some(i)
+                            }
+                            descs.push(tonbo::record::ColumnDesc {
+                                datatype,
+                                is_nullable: !is_not_nullable,
+                                name,
+                            })
+                        }
+                    } else {
+                        return Err(Error::ModuleError(format!(
+                            "`CreateTable` SQL syntax error: '{value}'"
+                        )));
+                    }
+                }
                 "addr" => {
                     if addr.is_some() {
                         return Err(Error::ModuleError("`addr` duplicate".to_string()));
@@ -79,24 +135,22 @@ impl TonboTable {
                 }
             }
         }
+        let pk_index = primary_key_index.ok_or_else(|| {
+            Error::ModuleError("primary key not found on `create_sql`".to_string())
+        })?;
         let table_name =
             table_name.ok_or_else(|| Error::ModuleError("`table_name` not found".to_string()))?;
-        let (create_table_sql, mut client, schema) = aux.unwrap().executor.block_on(async {
-            let mut client = TonboClient::connect(
+        let mut client = aux.unwrap().executor.block_on(async {
+            let client = TonboClient::connect(
                 addr.ok_or_else(|| Error::ModuleError("`addr` not found".to_string()))?,
+                table_name,
+                descs.clone(),
+                pk_index,
             )
             .await
             .map_err(|err| Error::ModuleError(err.to_string()))?;
-            let schema = client
-                .schema()
-                .await
-                .map_err(|err| Error::ModuleError(err.to_string()))?;
-            let create_table_sql = desc_to_create_table(&schema.desc, &table_name);
-            Ok::<(String, TonboClient, TonboSchema), rusqlite::Error>((
-                create_table_sql,
-                client,
-                schema,
-            ))
+
+            Ok::<TonboClient, rusqlite::Error>(client)
         })?;
         let (req_tx, req_rx): (_, Receiver<Request>) = flume::bounded(1);
         aux.unwrap().executor.spawn(async move {
@@ -122,21 +176,20 @@ impl TonboTable {
         });
 
         Ok((
-            create_table_sql,
+            create_sql.ok_or_else(|| Error::ModuleError("`create_sql` not found".to_string()))?,
             Self {
                 base: ffi::sqlite3_vtab::default(),
                 req_tx,
-                schema,
+                descs,
+                pk_index,
             },
         ))
     }
 
     fn _remove(&mut self, pk: i64) -> Result<(), Error> {
-        let desc: &ColumnDesc = &self.schema.primary_key_desc();
+        let desc: &tonbo::record::ColumnDesc = &self.descs[self.pk_index];
         let value = Column::new(
-            tonbo::record::Datatype::from(
-                Datatype::try_from(desc.ty).map_err(|err| Error::ModuleError(err.to_string()))?,
-            ),
+            desc.datatype,
             desc.name.clone(),
             Arc::new(pk),
             desc.is_nullable,
@@ -148,28 +201,22 @@ impl TonboTable {
 
     fn _insert(&mut self, args: ValueIter) -> Result<i64, Error> {
         let mut id = None;
-        let mut values = Vec::with_capacity(self.schema.len());
+        let mut values = Vec::with_capacity(self.descs.len());
 
-        for (i, (desc, value)) in self.schema.desc.iter().zip(args).enumerate() {
-            if i == self.schema.primary_key_index {
+        for (i, (desc, value)) in self.descs.iter().zip(args).enumerate() {
+            if i == self.pk_index {
                 id = Some(value);
             }
-            let datatype = tonbo::record::Datatype::from(
-                Datatype::try_from(desc.ty).map_err(|err| Error::ModuleError(err.to_string()))?,
-            );
             values.push(Column::new(
-                datatype,
+                desc.datatype,
                 desc.name.clone(),
-                value_trans(value, &datatype, desc.is_nullable)?,
+                value_trans(value, &desc.datatype, desc.is_nullable)?,
                 desc.is_nullable,
             ));
         }
 
         self.req_tx
-            .send(Request::Insert(DynRecord::new(
-                values,
-                self.schema.primary_key_index,
-            )))
+            .send(Request::Insert(DynRecord::new(values, self.pk_index)))
             .unwrap();
         Ok(id.unwrap().as_i64()?)
     }
@@ -313,42 +360,6 @@ unsafe impl VTabCursor for RecordCursor<'_> {
     }
 }
 
-fn data_type_to_sql_type(data_type: &Datatype) -> &str {
-    match data_type {
-        Datatype::Uint8 => "TINYINT UNSIGNED",
-        Datatype::Uint16 => "SMALLINT UNSIGNED",
-        Datatype::Uint32 => "INT UNSIGNED",
-        Datatype::Uint64 => "BIGINT UNSIGNED",
-        Datatype::Int8 => "TINYINT",
-        Datatype::Int16 => "SMALLINT",
-        Datatype::Int32 => "INT",
-        Datatype::Int64 => "BIGINT",
-        Datatype::String => "TEXT",
-        Datatype::Boolean => "BOOLEAN",
-        Datatype::Bytes => "BLOB",
-    }
-}
-
-fn desc_to_create_table(desc: &[ColumnDesc], table_name: &str) -> String {
-    let columns: Vec<String> = desc
-        .iter()
-        .map(|field| {
-            format!(
-                "{} {} {}",
-                field.name,
-                data_type_to_sql_type(&Datatype::try_from(field.ty).unwrap()),
-                if field.is_nullable { "nullable" } else { "" }
-            )
-        })
-        .collect();
-
-    format!(
-        "CREATE TABLE {} (\n    {}\n);",
-        table_name,
-        columns.join(",\n    ")
-    )
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use rusqlite::Connection;
@@ -360,6 +371,7 @@ pub(crate) mod tests {
 
         db.execute_batch(
             "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
+                    create_sql = 'create table tonbo(id bigint primary key, name varchar, like int)',
                     table_name ='tonbo',
                     addr = 'http://[::1]:50051',
             );",
