@@ -411,7 +411,6 @@ pub(crate) mod tests {
         db.execute_batch(
             "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
                     create_sql = 'create table tonbo(id bigint primary key, name varchar, like int)',
-                    addr = 'http://[::1]:50051',
             );",
         )?;
         for i in 0..3 {

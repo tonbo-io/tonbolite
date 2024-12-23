@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["tokio"]
-tokio = ["dep:tokio",  "tonbo_net_client/default"]
+tokio = ["dep:tokio", "tonbo_net_client/default"]
 wasm = [
     "dep:wasm_thread",
     "dep:wasm-bindgen",
