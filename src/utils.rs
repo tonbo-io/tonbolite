@@ -4,7 +4,7 @@ use rusqlite::Error;
 use sqlparser::ast::DataType;
 use std::any::Any;
 use std::sync::Arc;
-use tonbo::record::{Column, Datatype};
+use tonbo::record::{Datatype, Value};
 
 macro_rules! nullable_value {
     ($value:expr, $is_nullable:expr) => {
@@ -100,7 +100,7 @@ pub(crate) fn value_trans(
     }
 }
 
-pub(crate) fn set_result(ctx: &mut Context, col: &Column) -> rusqlite::Result<()> {
+pub(crate) fn set_result(ctx: &mut Context, col: &Value) -> rusqlite::Result<()> {
     match &col.datatype {
         Datatype::UInt8 => {
             if col.is_nullable {

@@ -5,15 +5,15 @@ mod connection;
 #[cfg(feature = "wasm")]
 pub use connection::*;
 
-mod tokio;
+mod db;
 
 mod utils;
+use crate::db::{DbState, TonboTable};
 use rusqlite::vtab::update_module;
 use std::fs;
 use std::sync::Arc;
 
-use crate::tokio::{DbState, TonboTable};
-
+#[no_mangle]
 pub fn load_module(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     let _ = fs::create_dir_all("./db_path/tonbo");
 

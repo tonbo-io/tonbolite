@@ -8,6 +8,7 @@ let conn;
 
   await conn.create(`CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
       create_sql ='create table tonbo(id bigint primary key, name varchar, like int)',
+      path = 'db_path/tonbo'
     );`);
 
   for (let i = 0; i < 10; i++) {
@@ -16,42 +17,12 @@ let conn;
     );
   }
 
+  await conn.delete("DELETE FROM tonbo WHERE id = 4");
+  await conn.update("UPDATE tonbo SET name = 'tonbo' WHERE id = 6");
+
   const rows = await conn.select("SELECT * FROM tonbo limit 10");
   console.log(rows);
 
 })();
 
-onmessage = function (event) {
-  const sql = event.data.sql;
-  const type = event.data.type;
-  switch (type) {
-    case "select":
-      conn.select(sql).then((res) => {
-        this.postMessage({ type: type, data: res });
-      });
-      break;
-    case "insert":
-      conn.insert(sql).then((res) => {
-        this.postMessage({ type: type, data: res });
-      });
-      break;
-    case "delete":
-      conn.delete(sql).then((res) => {
-        this.postMessage({ type: type, data: res });
-      });
-      break;
-    case "update":
-      conn.update(sql).then((res) => {
-        this.postMessage({ type: type, data: res });
-      });
-      break;
-    case "flush":
-      const table = event.data.table;
-      conn.flush(table).then(() => {
-        this.postMessage({ type: type });
-      });
-      break;
-    default:
-      break;
-  }
-};
+

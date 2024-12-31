@@ -9,26 +9,28 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["tokio"]
-tokio = ["dep:tokio", "tonbo_net_client/default"]
+tokio = ["dep:tokio", "tonbo/tokio", "tonbo/tokio-http"]
 wasm = [
     "dep:wasm_thread",
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
     "fusio/no-send",
-    "tonbo_net_client/wasm"
+    "tonbo/wasm",
+    "tonbo/sync"
 ]
 
 [dependencies]
 flume = "0.11"
-fusio = { git = "https://github.com/tonbo-io/fusio.git", rev = "88c6134948d05bef33598a969e9292ad38a8db4b", package = "fusio", features = [
+fusio = { version = "0.3.4", package = "fusio", features = [
     "dyn",
     "fs",
     "aws",
 ] }
+fusio-dispatch = { version = "0.3.4", package = "fusio-dispatch", features = ["aws"] }
 futures-util = "0.3"
 tokio = { version = "1.41", optional = true, features = ["rt-multi-thread"] }
-tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "a6ee2303464667d3689ae1c1b075bb25840063d7", package = "tonbo", default-features = false }
-tonbo_net_client = { git = "https://github.com/tonbo-io/tonbo", rev = "a6ee2303464667d3689ae1c1b075bb25840063d7", default-features = false, package = "tonbo_net_client" }
+# tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "a6ee2303464667d3689ae1c1b075bb25840063d7", package = "tonbo", default-features = false }
+tonbo = { path = "../tonbo", package = "tonbo", default-features = false, features = ["aws"] }
 rusqlite = { git = "https://github.com/tonbo-io/rusqlite", branch = "feat/integrity", features = [
     "vtab",
     "bundled",
@@ -39,14 +41,13 @@ wasm-bindgen = { version = "0.2.93", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 wasm_thread = { version = "0.3", optional = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 log = "0.4"
 console_log = { version = "1.0", features = ["color"] }
 console_error_panic_hook = "0.1.7"
+
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
-
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = false
 
 [patch.crates-io.wasm_thread]
 git = "https://github.com/Twey/wasm_thread"
