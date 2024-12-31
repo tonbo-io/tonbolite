@@ -29,8 +29,7 @@ fusio = { version = "0.3.4", package = "fusio", features = [
 fusio-dispatch = { version = "0.3.4", package = "fusio-dispatch", features = ["aws"] }
 futures-util = "0.3"
 tokio = { version = "1.41", optional = true, features = ["rt-multi-thread"] }
-# tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "a6ee2303464667d3689ae1c1b075bb25840063d7", package = "tonbo", default-features = false }
-tonbo = { path = "../tonbo", package = "tonbo", default-features = false, features = ["aws"] }
+tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "8c3ad6ffe0d40c8be1332ccbcf9d230f838f73ba", package = "tonbo", default-features = false, features = ["aws"] }
 rusqlite = { git = "https://github.com/tonbo-io/rusqlite", branch = "feat/integrity", features = [
     "vtab",
     "bundled",
