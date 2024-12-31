@@ -8,7 +8,7 @@ use std::future::Future;
 #[cfg(not(feature = "wasm"))]
 pub type SQLiteExecutor = tokio::TokioExecutor;
 #[cfg(feature = "wasm")]
-pub type SQLiteExecutor = wasm::WasmExecutor;
+pub type SQLiteExecutor = tonbo::executor::opfs::OpfsExecutor;
 
 pub trait BlockOnExecutor: tonbo::executor::Executor {
     fn block_on<F: Future>(&self, future: F) -> F::Output;
