@@ -5,8 +5,8 @@ async function initWorker() {
     let conn = new tonbo.Connection();
 
     await conn.create(`CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
-      table_name ='tonbo',
-      addr = 'http://localhost:50051',
+      create_sql ='create table tonbo(id bigint primary key, name varchar, like int)',
+      path = 'db_path/tonbo'
     );`);
 
     for (let i = 0; i < 10; i ++) {
