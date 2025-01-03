@@ -5,14 +5,68 @@ TonboLite is a WASM compatible SQLite extension that allows users to create tabl
 
 ## Features
 - Organizing [Parquet](https://parquet.apache.org/) files using [Log-Structured Merge Tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree) for fast writing
-- Supporting S3 as remote storage
+- Supports OPFS, S3 as remote storage or mixed them together as storage back-end.
 - Compatibility with WebAssembly
 
 ## Usage
 
+### Use in SQLite CLI
+You can use [`.load`](https://www.sqlite.org/cli.html#loading_extensions) command to load a SQLite extension
+```bash
+sqlite> .load target/release/libsqlite_tonbo
+
+sqlite> CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
+    create_sql = 'create table tonbo(id bigint primary key, name varchar, like int)',
+    path = 'db_path/tonbo'
+);
+sqlite> insert into tonbo (id, name, like) values (0, 'tonbo', 100);
+sqlite> insert into tonbo (id, name, like) values (1, 'sqlite', 200);
+
+sqlite> select * from tonbo;
+0|tonbo|100
+1|sqlite|200
+
+sqlite> update tonbo set like = 123 where id = 0;
+
+sqlite> select * from tonbo;
+0|tonbo|123
+1|sqlite|200
+
+sqlite> delete from tonbo where id = 0;
+
+sqlite> select * from tonbo;
+1|sqlite|200
+```
+
+Or you can use SQLite extension in Python:
+```python
+import sqlite3
+
+conn = sqlite3.connect(":memory")
+conn.enable_load_extension(True)
+# Load the tonbolite extension
+conn.load_extension("target/release/libsqlite_tonbo.dylib")
+con.enable_load_extension(False)
+
+conn.execute("CREATE VIRTUAL TABLE temp.tonbo USING tonbo("
+                "create_sql = 'create table tonbo(id bigint primary key, name varchar, like int)', "
+                "path = 'db_path/tonbo'"
+             ")")
+conn.execute("INSERT INTO tonbo (id, name, like) VALUES (0, 'lol', 1)")
+conn.execute("INSERT INTO tonbo (id, name, like) VALUES (1, 'lol', 100)")
+rows = conn.execute("SELECT * FROM tonbo;")
+for row in rows:
+    print(row)
+```
+
 ### Use in Rust
 TonboLite can be used just like a regular SQLite program.
-
+> Please use our Rusqlite patch
+> ```toml
+> [patch.crates-io.rusqlite]
+> git = "https://github.com/tonbo-io/rusqlite"
+> branch = "feat/integrity"
+> ```
 ```rust
 #[tokio::main]
 async fn main() -> rusqlite::Result<()>  {
@@ -24,6 +78,7 @@ async fn main() -> rusqlite::Result<()>  {
     db.execute_batch(
         "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
             create_sql = 'create table tonbo(id bigint primary key, name varchar, like int)'
+            path = 'db_path/tonbo'
         );",
     )?;
     db.execute("INSERT INTO tonbo (id, name, like) VALUES (0, 'lol', 1)", [])?;
@@ -49,6 +104,7 @@ const conn = new tonbo.Connection();
 await conn.create(
     `CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
         create_sql = 'create table tonbo(id bigint primary key, name varchar, like int)',
+        path = 'db_path/tonbo'
     );`
 );
 
@@ -69,7 +125,11 @@ await conn.flush("tonbo");
 
 ## Build
 
-
+### Build as Extension
+```sh
+cargo build --release --features loadable_extension
+```
+Once building successfully, you will get a file named libsqlite_tonbo.dylib(`.dll` on windows, `.so` on most other unixes) in *target/release/*
 ### Build on Rust
 
 ```sh
