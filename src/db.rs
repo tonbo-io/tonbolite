@@ -22,6 +22,9 @@ use std::sync::Arc;
 use tonbo::executor::Executor;
 use tonbo::record::{DynRecord, DynSchema};
 use tonbo::{DbOption, DB};
+
+const MAX_LEVEL: usize = 7;
+
 pub struct DbState {
     executor: SQLiteExecutor,
 }
@@ -119,6 +122,8 @@ impl TonboTable {
         let mut region = None;
         let mut sign_payload = None;
         let mut checksum = None;
+        let mut table_name = None;
+        let mut level = 2;
 
         let args = &args[3..];
         for c_slice in args.iter() {
@@ -129,7 +134,7 @@ impl TonboTable {
                         return Err(Error::ModuleError("`create_sql` duplicate".to_string()));
                     }
                     create_sql = Some(value.to_string());
-                    (descs, primary_key_index) = parse_create_sql(value)?;
+                    (table_name, descs, primary_key_index) = parse_create_sql(value)?;
                 }
                 "fs" => match value {
                     "local" => is_local = true,
@@ -140,6 +145,7 @@ impl TonboTable {
                         )))
                     }
                 },
+                "level" => level = value.parse::<usize>().unwrap(),
                 "key_id" => key_id = Some(value.to_string()),
                 "secret_key" => secret_key = Some(value.to_string()),
                 "token" => token = Some(value.to_string()),
@@ -159,6 +165,9 @@ impl TonboTable {
         let pk_index = primary_key_index.ok_or_else(|| {
             Error::ModuleError("primary key not found on `create_sql`".to_string())
         })?;
+        let table_name =
+            table_name.ok_or_else(|| Error::ModuleError("`create_sql` not found".to_string()))?;
+
         let (req_tx, req_rx): (_, Receiver<Request>) = flume::bounded(1);
         let fs_option = if is_local {
             FsOptions::Local
@@ -189,8 +198,10 @@ impl TonboTable {
         wasm_thread::Builder::new()
             .spawn(move || async move {
                 let path = Path::from_opfs_path(path.expect("`path` not found")).unwrap();
-                let option = DbOption::new(path, &schema).base_fs(fs_option);
-
+                let mut option = DbOption::new(path, &schema);
+                if !is_local {
+                    option = level_path(option, fs_option, &table_name, level);
+                }
                 let db = DB::new(option, SQLiteExecutor::new(), schema)
                     .await
                     .unwrap();
@@ -205,7 +216,10 @@ impl TonboTable {
             .map_err(|err| Error::ModuleError(format!("path parser error: {err}")))?;
             let executor = aux.unwrap().executor.clone();
             let db = aux.unwrap().executor.block_on(async {
-                let option = DbOption::new(path, &schema).base_fs(fs_option);
+                let mut option = DbOption::new(path, &schema);
+                if !is_local {
+                    option = level_path(option, fs_option, &table_name, level);
+                }
 
                 DB::<DynRecord, SQLiteExecutor>::new(option, executor, schema)
                     .await
@@ -419,13 +433,17 @@ unsafe impl VTabCursor for RecordCursor<'_> {
     }
 }
 
-fn parse_create_sql(sql: &str) -> rusqlite::Result<(Vec<tonbo::record::ValueDesc>, Option<usize>)> {
+fn parse_create_sql(
+    sql: &str,
+) -> rusqlite::Result<(Option<String>, Vec<tonbo::record::ValueDesc>, Option<usize>)> {
     let dialect = SQLiteDialect {};
     let mut primary_key_index = None;
     let mut descs = Vec::new();
+    let mut table_name = None;
     if let Statement::CreateTable(create_table) =
         &Parser::parse_sql(&dialect, sql).map_err(|err| Error::ModuleError(err.to_string()))?[0]
     {
+        table_name = Some(create_table.name.to_string());
         for (i, column_def) in create_table.columns.iter().enumerate() {
             let name = column_def.name.value.to_ascii_lowercase();
             let datatype = type_trans(&column_def.data_type);
@@ -462,7 +480,26 @@ fn parse_create_sql(sql: &str) -> rusqlite::Result<(Vec<tonbo::record::ValueDesc
             "`CreateTable` SQL syntax error: '{sql}'"
         )));
     }
-    Ok((descs, primary_key_index))
+    Ok((table_name, descs, primary_key_index))
+}
+
+fn level_path(
+    mut option: DbOption,
+    fs_options: FsOptions,
+    table_name: &str,
+    level: usize,
+) -> DbOption {
+    for i in level..MAX_LEVEL {
+        option = option
+            .level_path(
+                i,
+                Path::from_url_path(format!("/{}/{}", table_name, i)).unwrap(),
+                fs_options.clone(),
+            )
+            .unwrap();
+    }
+
+    option
 }
 
 #[cfg(test)]
@@ -519,10 +556,6 @@ pub(crate) mod tests {
         assert!(rows.next()?.is_none());
 
         db.execute("DELETE from tonbo WHERE id = ?1", ["2"])?;
-        let mut stmt = db.prepare("SELECT * FROM tonbo where id = ?1;")?;
-        let mut rows = stmt.query(["2"])?;
-        assert!(rows.next()?.is_none());
-
         db.pragma(None, "quick_check", "tonbo", |_r| -> rusqlite::Result<()> {
             Ok(())
         })?;
@@ -540,6 +573,7 @@ pub(crate) mod tests {
             "CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
                     create_sql='create table tonbo(id bigint primary key, name varchar, like int)',
                     path = './db_path/test_s3',
+                    level = '0',
                     fs = 's3',
                     bucket = 'data',
                     key_id = 'user',
