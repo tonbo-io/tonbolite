@@ -38,7 +38,7 @@ sqlite> select * from tonbo;
 1|sqlite|200
 ```
 
-Or you can use SQLite extension in Python:
+Or use SQLite extension in Python:
 ```python
 import sqlite3
 
@@ -60,7 +60,7 @@ for row in rows:
 ```
 
 ### Use in Rust
-TonboLite can be used just like a regular SQLite program.
+TonboLite is able to be used just like a regular SQLite program.
 > Please use our Rusqlite patch
 > ```toml
 > [patch.crates-io.rusqlite]
@@ -123,7 +123,7 @@ await conn.flush("tonbo");
 ```
 
 ## Configuration
-You can configure tonbolite in `CREATE` statement, here are some options you can configure
+Configure tonbolite in `CREATE` statement:
 - `create_sql`(required): The `CREATE` SQL statement
 - `path`(required): Path to local storage
 - `fs`: `local`/`s3`
