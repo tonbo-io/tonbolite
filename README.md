@@ -122,6 +122,35 @@ const rows = await conn.select("SELECT * from tonbo");
 await conn.flush("tonbo");
 ```
 
+## Configuration
+You can configure tonbolite in `CREATE` statement, here are some options you can configure
+- `create_sql`(required): The `CREATE` SQL statement
+- `path`(required): Path to local storage
+- `fs`: `local`/`s3`
+- `level`: All data below the level will be stored in local storage, otherwise, it will be stored in S3.
+- S3 option:
+  - `key_id`: The S3 access key
+  - `secret_key`: The S3 secret access key
+  - `bucket`: The S3 bucket
+  - `endpoint`: The S3 endpoint
+  - `region`: The S3 region
+  - `sign_payload`: `true`/`false`. Whether to use payload
+  - `checksum`: `true`/`false`. Whether to use checksum
+  - `token`: security token
+
+Here is an example to configure S3 storage:
+```sql
+CREATE VIRTUAL TABLE temp.tonbo USING tonbo(
+    create_sql='create table tonbo(id bigint primary key, name varchar, like int)',
+    path = 'db_path/test_s3',
+    level = '0',
+    fs = 's3',
+    bucket = 'bucket',
+    key_id = 'access_key',
+    secret_key = 'access_secret_key',
+    endpoint = 'https://xxx.s3.us-east.amazonaws.com'
+);
+```
 
 ## Build
 
