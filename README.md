@@ -11,7 +11,7 @@ TonboLite is a WASM compatible SQLite extension that allows users to create tabl
 ## Usage
 
 ### Use in SQLite CLI
-You can use [`.load`](https://www.sqlite.org/cli.html#loading_extensions) command to load a SQLite extension
+Use [`.load`](https://www.sqlite.org/cli.html#loading_extensions) command to load a SQLite extension
 ```bash
 sqlite> .load target/release/libsqlite_tonbo
 
@@ -95,7 +95,7 @@ async fn main() -> rusqlite::Result<()>  {
 
 ### Use in Wasm
 
-TonboLiet exposed an easy-to-use API
+TonboLite exposed an easy-to-use API
 
 ```js
 const conn = new tonbo.Connection();
