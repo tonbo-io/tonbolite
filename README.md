@@ -1,3 +1,17 @@
+<p align="center">
+    <picture>
+      <img src="https://github.com/user-attachments/assets/a9b74b54-38c6-47a3-9a88-5c91e5f2d7d2" width="200"/>
+    </picture>
+</p>
+
+<p align="center">
+    <a href="https://github.com/tonbo-io/tonbolite/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache_2.0-green" alt="License - Apache 2.0"></a>
+    <a href="#roadmap"><img src="https://img.shields.io/badge/status-alpha-orange" alt="Status - Alpha"></a>
+    <a href="https://discord.electric-sql.com"><img src="https://img.shields.io/discord/1270294987355197460?color=5969EA&label=discord" alt="Chat - Discord"></a>
+    <a href="https://x.com/tonboio" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow @tonboio"></a>
+</p>
+
+<br />
 
 # TonboLite
 
