@@ -56,3 +56,7 @@ branch = "feat/integrity"
 [patch.crates-io.wasm_thread]
 git = "https://github.com/Twey/wasm_thread"
 branch = "post-message"
+
+[profile.release]
+codegen-units = 1
+lto = true
