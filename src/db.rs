@@ -388,7 +388,7 @@ impl UpdateVTab<'_> for TonboTable {
 }
 
 unsafe impl VTabCursor for RecordCursor<'_> {
-    fn filter(&mut self, _: c_int, _: Option<&str>, v: &Values<'_>) -> rusqlite::Result<()> {
+    fn filter(&mut self, _: c_int, _: Option<&str>, _v: &Values<'_>) -> rusqlite::Result<()> {
         let (tuple_tx, tuple_rx) = flume::bounded(5);
 
         self.req_tx
@@ -562,6 +562,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    #[ignore = "s3"]
     #[test]
     fn test_load_module_on_s3() -> rusqlite::Result<()> {
         let _ = fs::create_dir_all("./db_path/test_s3");

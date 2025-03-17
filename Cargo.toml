@@ -16,26 +16,27 @@ wasm = [
     "dep:wasm-bindgen-futures",
     "fusio/no-send",
     "tonbo/wasm",
-    "tonbo/sync"
+    "tonbo/sync",
 ]
 loadable_extension = ["rusqlite/functions", "rusqlite/loadable_extension"]
 
 [dependencies]
 flume = "0.11"
-fusio = { version = "=0.3.4", package = "fusio", features = [
+fusio = { version = "0.3.7", package = "fusio", features = [
     "dyn",
     "fs",
     "aws",
 ] }
-fusio-dispatch = { version = "=0.3.4", package = "fusio-dispatch", features = ["aws"] }
-fusio-parquet = { version = "=0.3.4", package = "fusio-parquet" }
+fusio-dispatch = { version = "0.3.7", package = "fusio-dispatch", features = [
+    "aws",
+] }
+fusio-parquet = { version = "0.3.7", package = "fusio-parquet" }
 futures-util = "0.3"
 tokio = { version = "1.41", optional = true, features = ["rt-multi-thread"] }
-tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "8c3ad6ffe0d40c8be1332ccbcf9d230f838f73ba", package = "tonbo", default-features = false, features = ["aws"] }
-rusqlite = { version = "0.32.1", features = [
-    "vtab",
-    "bundled",
+tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "624067822b9a451d6dc95841f4b135ee9faddf1a", package = "tonbo", default-features = false, features = [
+    "aws",
 ] }
+rusqlite = { version = "0.32.1", features = ["vtab", "bundled"] }
 sqlparser = "0.52"
 
 wasm-bindgen = { version = "0.2.93", optional = true }
@@ -49,6 +50,7 @@ console_log = { version = "1.0", features = ["color"] }
 console_error_panic_hook = "0.1.7"
 
 [dev-dependencies]
+tempfile = "3"
 wasm-bindgen-test = "0.3"
 
 [patch.crates-io.rusqlite]
