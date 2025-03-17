@@ -22,12 +22,13 @@ loadable_extension = ["rusqlite/functions", "rusqlite/loadable_extension"]
 
 [dependencies]
 flume = "0.11"
-fusio = { version = "0.3.4", package = "fusio", features = [
+fusio = { version = "=0.3.4", package = "fusio", features = [
     "dyn",
     "fs",
     "aws",
 ] }
-fusio-dispatch = { version = "0.3.4", package = "fusio-dispatch", features = ["aws"] }
+fusio-dispatch = { version = "=0.3.4", package = "fusio-dispatch", features = ["aws"] }
+fusio-parquet = { version = "=0.3.4", package = "fusio-parquet" }
 futures-util = "0.3"
 tokio = { version = "1.41", optional = true, features = ["rt-multi-thread"] }
 tonbo = { git = "https://github.com/tonbo-io/tonbo", rev = "8c3ad6ffe0d40c8be1332ccbcf9d230f838f73ba", package = "tonbo", default-features = false, features = ["aws"] }
@@ -42,6 +43,7 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 wasm_thread = { version = "0.3", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3.1", features = ["wasm_js"] }
 log = "0.4"
 console_log = { version = "1.0", features = ["color"] }
 console_error_panic_hook = "0.1.7"
